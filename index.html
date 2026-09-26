@@ -15,9 +15,8 @@
     </div>
     <div class="actions" id="actions" hidden>
       <button type="button" class="btn ghost" id="btn-history">履歴</button>
-      <button type="button" class="btn ghost hide-narrow" id="btn-copy">テキストをコピー</button>
-      <button type="button" class="btn" id="btn-docx">Word出力</button>
-      <button type="button" class="btn primary" id="btn-print">印刷 / PDF</button>
+      <button type="button" class="btn ghost hide-narrow" id="btn-new-case">新しい案件</button>
+      <button type="button" class="btn primary" id="btn-docx">Word出力</button>
     </div>
   </header>
 
@@ -26,17 +25,24 @@
     <aside class="sidebar">
       <ul id="tpl-list" class="tpl-list"></ul>
       <div class="side-actions">
-        <button type="button" class="btn block" id="btn-new-tpl">＋ 新しいひな形</button>
+        <button type="button" class="btn primary block" id="btn-new-tpl">＋ Wordからひな形を作る</button>
         <button type="button" class="btn ghost block" id="btn-import">ひな形ファイルを読み込む</button>
         <button type="button" class="link-btn" id="btn-export-all">マイひな形をすべて書き出す</button>
-        <input type="file" id="import-file" accept=".json,application/json" hidden>
+        <input type="file" id="file-docx" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
+        <input type="file" id="file-import" accept=".json,.js,application/json" hidden>
       </div>
     </aside>
 
     <!-- 入力フォーム -->
     <main class="editor">
       <div id="empty-state" class="empty-state">
-        <p>左の一覧からひな形を選んでください。</p>
+        <p class="empty-title">まずは Word のひな形を登録しましょう</p>
+        <ol>
+          <li>左下の「＋ Wordからひな形を作る」で、いつも使っている契約書（.docx）を選ぶ</li>
+          <li>毎回変わる文字（お客様名・金額・日付など）を選択して、入力項目にする</li>
+          <li>保存すると、入力フォームだけで契約書が作れるようになります</li>
+        </ol>
+        <p class="muted">元の Word の書式（フォント・文字サイズ・改行・余白・表）は一切変更されません。</p>
       </div>
       <section id="form-pane" hidden>
         <div class="form-head">
@@ -53,8 +59,8 @@
             </div>
             <span class="spacer"></span>
             <button type="button" class="link-btn" id="btn-edit-tpl">ひな形を編集</button>
-            <button type="button" class="link-btn" id="btn-clear">入力をクリア</button>
           </div>
+          <p class="case-note">同じ項目は、ほかの書類（約款・合意書など）にも自動で入ります。</p>
         </div>
         <form id="form" autocomplete="off"></form>
       </section>
@@ -62,49 +68,39 @@
 
     <!-- プレビュー -->
     <section class="preview-pane" aria-label="プレビュー">
-      <article class="paper" id="paper"></article>
+      <div class="preview-note">確認用の簡易表示です。出力される Word は元ファイルの書式のまま、差し込み箇所の文字だけが変わります。</div>
+      <div id="paper" class="paper-wrap"></div>
     </section>
   </div>
 
   <button type="button" id="btn-toggle-preview" class="btn primary floating only-narrow">プレビュー ⇄ 入力</button>
 
   <!-- ひな形エディタ -->
-  <dialog id="tpl-editor" class="modal modal-lg">
+  <dialog id="tpl-editor" class="modal modal-full">
     <div class="modal-head">
       <h2 id="te-heading">ひな形の編集</h2>
       <button type="button" class="icon-btn" data-close aria-label="閉じる">×</button>
     </div>
     <div class="modal-body te-layout">
       <div class="te-left">
-        <p id="te-note" class="note" hidden>標準ひな形は直接変更できないため、「マイひな形」にコピーとして保存されます。</p>
+        <p id="te-note" class="note" hidden>配布ひな形は直接変更できないため、「マイひな形」にコピーとして保存されます。</p>
         <div class="te-meta">
-          <label>ひな形の名前<input id="te-name" placeholder="例：業務委託契約書（A社向け）"></label>
+          <label>ひな形の名前<input id="te-name" placeholder="例：工事請負契約書"></label>
           <label>説明（任意）<input id="te-desc" placeholder="一覧に表示される短い説明"></label>
-          <label class="te-wide">保存時のファイル名（任意）<input id="te-filename" placeholder="例：業務委託契約書_{{乙_名称}}"></label>
+          <label class="te-wide">出力ファイル名（任意）<input id="te-filename" placeholder="例：工事請負契約書_{{注文者_氏名}}"></label>
         </div>
         <div class="te-toolbar">
-          <button type="button" class="btn small" id="te-make-field">選択した文字を入力項目にする</button>
-          <button type="button" class="btn small ghost" id="te-insert-article">第○条を挿入</button>
-          <button type="button" class="btn small ghost" id="te-insert-if">ON/OFFで出し分け</button>
+          <span class="te-howto"><b>使い方：</b>下の文書で変わる文字をドラッグで選択 →「入力項目にする」</span>
+          <span class="spacer"></span>
+          <button type="button" class="btn small ghost" id="te-undo" disabled>↶ 元に戻す</button>
         </div>
-        <textarea id="te-body" spellcheck="false" aria-label="本文"></textarea>
-        <details class="help">
-          <summary>本文の書き方</summary>
-          <table>
-            <tr><td><code>{{乙_名称}}</code></td><td>入力項目。同じ名前はすべて同じ値が入ります</td></tr>
-            <tr><td><code>{{契約日:date}}</code></td><td>種類を指定（date 日付 / money 金額 / textarea 複数行 / number 数値 / select 選択肢）</td></tr>
-            <tr><td><code># タイトル</code></td><td>中央・大きい文字のタイトル</td></tr>
-            <tr><td><code>## 第{{条}}条（目的）</code></td><td>太字の見出し。<code>{{条}}</code> は条番号を自動で振ります</td></tr>
-            <tr><td><code>&gt; 甲　住所…</code></td><td>右寄りに字下げ（署名欄）</td></tr>
-            <tr><td><code>&gt;&gt; 文字</code></td><td>右寄せ</td></tr>
-            <tr><td><code>{{#if 自動更新}}…{{else}}…{{/if}}</code></td><td>ON/OFF で文章を出し分け</td></tr>
-            <tr><td><code>===</code></td><td>改ページ</td></tr>
-          </table>
-          <p class="muted">Word の契約書をそのまま貼り付け、変わる部分を選択して「選択した文字を入力項目にする」を押すのが一番簡単です。</p>
-        </details>
+        <div class="te-doc-wrap">
+          <div id="te-doc" class="paper-wrap selectable"></div>
+          <button type="button" id="te-pop" class="btn primary small te-pop" hidden>この文字を入力項目にする</button>
+        </div>
       </div>
       <div class="te-right">
-        <h3>入力項目 <small class="muted">本文の {{…}} から自動で作られます</small></h3>
+        <h3>入力項目 <small class="muted" id="te-count"></small></h3>
         <datalist id="te-groups"></datalist>
         <div id="te-fields"></div>
       </div>
@@ -112,9 +108,32 @@
     <div class="modal-foot">
       <button type="button" class="btn danger ghost" id="te-delete">削除</button>
       <button type="button" class="btn ghost" id="te-export">ファイルに書き出す</button>
+      <button type="button" class="btn ghost" id="te-export-js">配布用に書き出す</button>
       <span class="spacer"></span>
       <button type="button" class="btn ghost" data-close>キャンセル</button>
       <button type="button" class="btn primary" id="te-save">保存</button>
+    </div>
+  </dialog>
+
+  <!-- 入力項目にするダイアログ -->
+  <dialog id="mark-dialog" class="modal">
+    <div class="modal-head">
+      <h2>入力項目にする</h2>
+      <button type="button" class="icon-btn" data-close aria-label="閉じる">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="mark-selected">選択した文字：<span id="mark-text"></span></p>
+      <label class="mark-label">項目名
+        <input id="mark-key" list="mark-keys" placeholder="例：注文者_氏名（下の候補から選ぶと便利です）">
+      </label>
+      <datalist id="mark-keys"></datalist>
+      <label class="mark-all" id="mark-all-wrap"><input type="checkbox" id="mark-all" checked> 文書内の同じ文字 <b id="mark-all-count"></b> 箇所をすべて置き換える</label>
+      <div class="mark-presets" id="mark-presets"></div>
+    </div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" data-close>キャンセル</button>
+      <button type="button" class="btn primary" id="mark-ok">入力項目にする</button>
     </div>
   </dialog>
 
@@ -129,11 +148,11 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-  <script src="js/docx.js"></script>
+  <script src="js/zip.js"></script>
+  <script src="js/docx-template.js"></script>
+  <script src="js/presets.js"></script>
   <script src="js/app.js"></script>
-  <!-- 標準ひな形：ファイルを templates/ に追加したら、ここに1行足す -->
-  <script src="templates/gyomu-itaku.js"></script>
-  <script src="templates/nda.js"></script>
-  <script src="templates/baibai.js"></script>
+  <!-- 配布ひな形：「配布用に書き出す」で作った .js を templates/ に置き、ここに1行足す -->
+  <script src="templates/sample-ukeoi.js"></script>
 </body>
 </html>

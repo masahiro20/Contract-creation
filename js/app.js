@@ -1,8 +1,9 @@
 /*
  * 契約書メーカー 本体
  *
- * ひな形の本文に {{項目名}} を書くと、入力フォームが自動で作られ、
- * 入力した内容がリアルタイムに契約書へ差し込まれる。
+ * 元の Word ファイルをひな形として登録し、変わる文字を {{項目名}} にしておくと、
+ * 入力フォームの内容をその位置に差し込んだ Word を出力する。
+ * 書式は元ファイルのまま（docx-template.js 参照）。
  */
 (function () {
   'use strict';
@@ -17,20 +18,14 @@
     money: '金額',
     number: '数値',
     select: '選択肢',
-    checkbox: 'ON / OFF',
   };
+  const NUMERIC_TYPES = ['date', 'money', 'number'];
   const DEFAULT_GROUP = '入力項目';
-  const RESERVED = new Set(['else', '条']);
-
-  // {{項目名}} または {{項目名:型}}
-  const PH_RE = /\{\{\s*([^{}#\/:\s][^{}:]*?)\s*(?::\s*([a-z]+)\s*)?\}\}/g;
-  // {{#if 項目}}...{{else}}...{{/if}} / {{#unless 項目}}...{{/unless}}
-  const COND_RE = /\{\{#(if|unless)\s+([^{}]+?)\s*\}\}([\s\S]*?)\{\{\/\1\s*\}\}/g;
-  const COND_KEY_RE = /\{\{#(?:if|unless)\s+([^{}]+?)\s*\}\}/g;
-  const ARTICLE_RE = /\{\{\s*条\s*\}\}/g;
+  const PRESETS = window.FIELD_PRESETS || [];
+  const PRESET_MAP = new Map(PRESETS.map((p) => [p.key, p]));
 
   // =====================================================================
-  // 保存 (ブラウザの localStorage)
+  // 保存
   // =====================================================================
   const store = {
     get(k, fallback) {
@@ -45,7 +40,7 @@
       try {
         localStorage.setItem('cc.' + k, JSON.stringify(v));
       } catch (e) {
-        /* 保存できなくても動作は続ける */
+        /* noop */
       }
     },
     del(k) {
@@ -57,35 +52,115 @@
     },
   };
 
-  // =====================================================================
-  // ひな形の登録・正規化
-  // =====================================================================
-  const builtinTemplates = [];
+  // Word ファイル本体は容量が大きいので IndexedDB に保存する
+  const idb = {
+    db: null,
+    open() {
+      if (this.db) return Promise.resolve(this.db);
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open('contract-maker', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('templates', { keyPath: 'id' });
+        req.onsuccess = () => resolve((this.db = req.result));
+        req.onerror = () => reject(req.error);
+      });
+    },
+    async tx(mode, fn) {
+      const db = await this.open();
+      return new Promise((resolve, reject) => {
+        const t = db.transaction('templates', mode);
+        const r = fn(t.objectStore('templates'));
+        t.oncomplete = () => resolve(r && r.result);
+        t.onerror = () => reject(t.error);
+      });
+    },
+    all() {
+      return this.tx('readonly', (s) => s.getAll());
+    },
+    put(rec) {
+      return this.tx('readwrite', (s) => s.put(rec));
+    },
+    del(id) {
+      return this.tx('readwrite', (s) => s.delete(id));
+    },
+  };
 
-  function detectFields(body) {
-    const found = [];
-    const seen = new Set();
-    const add = (key, type, index) => {
-      key = key.trim();
-      if (!key || RESERVED.has(key) || seen.has(key)) return;
-      seen.add(key);
-      found.push({ key, type, index });
-    };
-    let m;
-    const all = [];
-    PH_RE.lastIndex = 0;
-    while ((m = PH_RE.exec(body))) all.push({ key: m[1], type: m[2] || '', index: m.index });
-    COND_KEY_RE.lastIndex = 0;
-    while ((m = COND_KEY_RE.exec(body))) all.push({ key: m[1], type: 'checkbox', index: m.index });
-    all.sort((a, b) => a.index - b.index);
-    // 同じ項目に型指定付きの出現があればそれを優先
-    const typed = {};
-    for (const a of all) if (a.type && !typed[a.key.trim()]) typed[a.key.trim()] = a.type;
-    for (const a of all) add(a.key, typed[a.key.trim()] || 'text', a.index);
-    return found;
+  // =====================================================================
+  // ひな形の登録
+  // =====================================================================
+  const builtinRecords = [];
+  let customRecords = [];
+
+  function b64ToBuffer(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8.buffer;
   }
 
-  function normalizeField(f, detectedType) {
+  function bufferToB64(buf) {
+    const u8 = new Uint8Array(buf);
+    let bin = '';
+    for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    return btoa(bin);
+  }
+
+  function recordFromBundle(t, builtin) {
+    return {
+      id: String(t.id || 'tpl-' + Date.now().toString(36)),
+      name: t.name || '無題のひな形',
+      description: t.description || '',
+      fileName: t.fileName || '',
+      dateStyle: t.dateStyle === 'seireki' ? 'seireki' : 'wareki',
+      fields: Array.isArray(t.fields) ? t.fields : [],
+      bytes: b64ToBuffer(t.docx),
+      builtin,
+    };
+  }
+
+  /** templates/*.js（配布ひな形）から呼ばれる */
+  function registerBundle(bundle) {
+    for (const t of bundle.templates || []) {
+      if (!t || !t.docx) continue;
+      const rec = recordFromBundle(t, true);
+      const i = builtinRecords.findIndex((r) => r.id === rec.id);
+      if (i >= 0) builtinRecords[i] = rec;
+      else builtinRecords.push(rec);
+    }
+  }
+
+  function bundleOf(recs) {
+    return {
+      format: 'contract-maker',
+      version: 2,
+      templates: recs.map((r) => ({
+        id: r.id,
+        name: r.name,
+        description: r.description,
+        fileName: r.fileName,
+        dateStyle: r.dateStyle,
+        fields: r.fields,
+        docx: bufferToB64(r.bytes),
+      })),
+    };
+  }
+
+  const allRecords = () => [...builtinRecords, ...customRecords];
+  const findRecord = (id) => allRecords().find((r) => r.id === id) || null;
+
+  async function reloadCustoms() {
+    try {
+      customRecords = ((await idb.all()) || []).map((r) => ({ ...r, builtin: false }));
+    } catch (e) {
+      customRecords = customRecords || [];
+      toast('このブラウザではひな形を保存できません（プライベートモード等）');
+    }
+  }
+
+  // =====================================================================
+  // 入力項目
+  // =====================================================================
+  function makeField(key, detectedType, settings) {
+    const f = { ...(PRESET_MAP.get(key) || {}), ...(settings || {}) };
     let type = f.type || detectedType || 'text';
     if (!TYPE_LABELS[type]) type = 'text';
     const options = Array.isArray(f.options)
@@ -94,115 +169,46 @@
         ? f.options.split(/[,、\n]/).map((s) => s.trim()).filter(Boolean)
         : [];
     return {
-      key: f.key,
-      label: f.label || f.key,
+      key,
+      label: f.label || key,
       type,
       group: f.group || DEFAULT_GROUP,
-      required: f.required !== undefined ? !!f.required : type !== 'checkbox',
+      required: f.required !== undefined ? !!f.required : true,
       remember: !!f.remember,
       options,
       placeholder: f.placeholder || '',
       hint: f.hint || '',
       default: f.default,
+      zenkaku: !!f.zenkaku,
+      blank: typeof f.blank === 'string' ? f.blank : '',
+      sample: f.sample || '',
     };
   }
 
-  function normalizeTemplate(t, builtin) {
-    const body = String(t.body || '').replace(/\r\n?/g, '\n');
-    const detected = detectFields(body);
-    const detectedType = Object.fromEntries(detected.map((d) => [d.key, d.type]));
-    const fields = [];
-    const map = new Map();
-    for (const f of t.fields || []) {
-      if (!f || !f.key || map.has(f.key)) continue;
-      const nf = normalizeField(f, detectedType[f.key]);
-      fields.push(nf);
-      map.set(nf.key, nf);
-    }
-    for (const d of detected) {
-      if (map.has(d.key)) continue;
-      const nf = normalizeField({ key: d.key, group: t.defaultGroup }, d.type);
-      fields.push(nf);
-      map.set(nf.key, nf);
-    }
-    // 同じ表示名が複数あるとき（甲・乙の「会社名」など）は、グループ名を付けて区別する
-    const labelCount = {};
-    for (const f of fields) labelCount[f.label] = (labelCount[f.label] || 0) + 1;
-    for (const f of fields) f.markerLabel = labelCount[f.label] > 1 ? `${f.group}・${f.label}` : f.label;
-    return {
-      id: String(t.id || 'tpl-' + Date.now().toString(36)),
-      name: t.name || '無題のひな形',
-      description: t.description || '',
-      category: t.category || '',
-      fileName: t.fileName || '',
-      dateStyle: t.dateStyle === 'seireki' ? 'seireki' : 'wareki',
-      body,
-      fields,
-      fieldMap: map,
-      builtin: !!builtin,
-    };
+  function buildFields(detected, settingsList) {
+    const settings = settingsList instanceof Map ? settingsList : new Map((settingsList || []).map((f) => [f.key, f]));
+    const fields = detected.map((d) => makeField(d.key, d.type, settings.get(d.key)));
+    const count = {};
+    for (const f of fields) count[f.label] = (count[f.label] || 0) + 1;
+    for (const f of fields) f.markerLabel = count[f.label] > 1 ? `${f.group}・${f.label}` : f.label;
+    return fields;
   }
 
-  /** templates/*.js から呼ばれる */
-  function register(t) {
-    const nt = normalizeTemplate(t, true);
-    const i = builtinTemplates.findIndex((x) => x.id === nt.id);
-    if (i >= 0) builtinTemplates[i] = nt;
-    else builtinTemplates.push(nt);
-  }
-
-  function serializeTemplate(t) {
-    return {
-      id: t.id,
-      name: t.name,
-      description: t.description,
-      category: t.category,
-      fileName: t.fileName,
-      dateStyle: t.dateStyle,
-      fields: t.fields.map((f) => {
-        const o = { key: f.key, label: f.label, type: f.type, group: f.group };
-        if (f.required !== (f.type !== 'checkbox')) o.required = f.required;
-        if (f.remember) o.remember = true;
-        if (f.options.length) o.options = f.options;
-        if (f.placeholder) o.placeholder = f.placeholder;
-        if (f.hint) o.hint = f.hint;
-        if (f.default !== undefined) o.default = f.default;
-        return o;
-      }),
-      body: t.body,
-    };
-  }
-
-  function customTemplates() {
-    return store.get('customTemplates', []).map((t) => normalizeTemplate(t, false));
-  }
-
-  function saveCustomTemplate(t) {
-    const list = store.get('customTemplates', []);
-    const data = serializeTemplate(t);
-    const i = list.findIndex((x) => x.id === t.id);
-    if (i >= 0) list[i] = data;
-    else list.push(data);
-    store.set('customTemplates', list);
-  }
-
-  function deleteCustomTemplate(id) {
-    store.set(
-      'customTemplates',
-      store.get('customTemplates', []).filter((x) => x.id !== id)
-    );
-  }
-
-  function allTemplates() {
-    return [...builtinTemplates, ...customTemplates()];
-  }
-
-  function findTemplate(id) {
-    return allTemplates().find((t) => t.id === id) || null;
+  function serializeField(f) {
+    const o = { key: f.key, label: f.label, type: f.type, group: f.group, required: f.required };
+    if (f.remember) o.remember = true;
+    if (f.options && f.options.length) o.options = f.options;
+    if (f.placeholder) o.placeholder = f.placeholder;
+    if (f.hint) o.hint = f.hint;
+    if (f.default !== undefined) o.default = f.default;
+    if (f.zenkaku) o.zenkaku = true;
+    if (f.blank) o.blank = f.blank;
+    if (f.sample) o.sample = f.sample;
+    return o;
   }
 
   // =====================================================================
-  // 値の整形
+  // 値の整形（差し込む文字は、ここで作ったものがそのまま入る）
   // =====================================================================
   const ERAS = [
     { name: '令和', start: [2019, 5, 1] },
@@ -219,8 +225,7 @@
     if (style === 'seireki') return `${y}年${mo}月${d}日`;
     const n = y * 10000 + mo * 100 + d;
     for (const era of ERAS) {
-      const s = era.start[0] * 10000 + era.start[1] * 100 + era.start[2];
-      if (n >= s) {
+      if (n >= era.start[0] * 10000 + era.start[1] * 100 + era.start[2]) {
         const ey = y - era.start[0] + 1;
         return `${era.name}${ey === 1 ? '元' : ey}年${mo}月${d}日`;
       }
@@ -242,21 +247,23 @@
     return dec ? `${withComma}.${dec}` : withComma;
   }
 
-  function isEmpty(v) {
-    return v == null || v === '' || v === false;
+  function toZenkaku(s) {
+    return s
+      .replace(/[0-9]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xfee0))
+      .replace(/,/g, '，')
+      .replace(/\./g, '．');
   }
 
+  const isEmpty = (v) => v == null || v === '';
+
   function formatValue(f, raw, dateStyle) {
-    if (f.type === 'checkbox') return raw ? 'あり' : 'なし';
-    if (isEmpty(raw)) return '';
-    switch (f.type) {
-      case 'date':
-        return formatDate(raw, dateStyle);
-      case 'money':
-        return formatMoney(raw);
-      default:
-        return String(raw);
-    }
+    if (isEmpty(raw)) return f.blank || ''; // 未入力時の文字（ひな形ごとに設定）
+    let s;
+    if (f.type === 'date') s = formatDate(raw, dateStyle);
+    else if (f.type === 'money') s = formatMoney(raw);
+    else s = String(raw);
+    if (f.zenkaku && NUMERIC_TYPES.includes(f.type)) s = toZenkaku(s);
+    return s;
   }
 
   function todayIso() {
@@ -266,139 +273,20 @@
   }
 
   // =====================================================================
-  // 差し込み処理: ひな形 + 入力値 → ブロック配列
-  // =====================================================================
-  const DROP = '\u0000';
-
-  function applyConditions(body, values) {
-    for (let i = 0; i < 5; i++) {
-      const next = body.replace(COND_RE, (all, kind, key, inner) => {
-        const parts = inner.split(/\{\{\s*else\s*\}\}/);
-        const truthy = !isEmpty(values[key.trim()]);
-        let pick = (kind === 'if') === truthy ? parts[0] : parts[1] || '';
-        pick = pick.replace(/^\n/, '').replace(/\n$/, '');
-        return pick === '' ? DROP : pick;
-      });
-      if (next === body) break;
-      body = next;
-    }
-    // 条件で消えた結果だけが残る行は、行ごと削除する
-    return body
-      .split('\n')
-      .filter((line) => !(line.includes(DROP) && line.split(DROP).join('').trim() === ''))
-      .join('\n')
-      .split(DROP)
-      .join('');
-  }
-
-  function evaluate(tpl, values, dateStyle) {
-    let body = applyConditions(tpl.body, values);
-    let article = 0;
-    body = body.replace(ARTICLE_RE, () => String(++article));
-
-    const used = new Set();
-    const substitute = (text) => {
-      const segs = [];
-      let last = 0;
-      let m;
-      PH_RE.lastIndex = 0;
-      while ((m = PH_RE.exec(text))) {
-        const key = m[1].trim();
-        if (RESERVED.has(key)) continue;
-        if (m.index > last) segs.push({ t: 'text', v: text.slice(last, m.index) });
-        const f = tpl.fieldMap.get(key) || normalizeField({ key }, m[2]);
-        const v = formatValue(f, values[key], dateStyle);
-        const empty = v === '' && f.required;
-        used.add(key);
-        const label = f.markerLabel || f.label;
-        segs.push({ t: 'field', key, label, v: empty ? `【${label}】` : v, empty });
-        last = m.index + m[0].length;
-      }
-      if (last < text.length) segs.push({ t: 'text', v: text.slice(last) });
-      return segs;
-    };
-
-    const blocks = body.split('\n').map((line) => {
-      if (/^={3,}\s*$/.test(line)) return { kind: 'pagebreak', segs: [] };
-      let kind = 'para';
-      let text = line;
-      if (line.startsWith('# ')) (kind = 'title'), (text = line.slice(2));
-      else if (line.startsWith('## ')) (kind = 'heading'), (text = line.slice(3));
-      else if (line.startsWith('>> ')) (kind = 'right'), (text = line.slice(3));
-      else if (line.startsWith('> ') || line === '>') (kind = 'indent'), (text = line.slice(2));
-      else if (line.startsWith('^ ')) (kind = 'center'), (text = line.slice(2));
-      else if (line.trim() === '') kind = 'blank';
-      return { kind, segs: substitute(text) };
-    });
-
-    // 条件で使われていない項目も「使われている」扱いにする（ON/OFF項目）
-    COND_KEY_RE.lastIndex = 0;
-    let m;
-    while ((m = COND_KEY_RE.exec(tpl.body))) used.add(m[1].trim());
-
-    return { blocks, used };
-  }
-
-  function blocksToText(blocks) {
-    return blocks
-      .map((b) => {
-        if (b.kind === 'pagebreak') return '\n';
-        const t = b.segs.map((s) => s.v).join('');
-        if (b.kind === 'indent' || b.kind === 'right') return '　　　　　　　　　　' + t;
-        if (b.kind === 'title' || b.kind === 'center') return '　　　　　　　　' + t;
-        return t;
-      })
-      .join('\n');
-  }
-
-  function esc(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-
-  function blocksToHtml(blocks) {
-    return blocks
-      .map((b) => {
-        if (b.kind === 'pagebreak') return '<div class="pagebreak"></div>';
-        if (b.kind === 'blank') return '<div class="ln ln-blank">&nbsp;</div>';
-        const inner = b.segs
-          .map((s) => {
-            if (s.t === 'text') return esc(s.v);
-            const cls = s.empty ? 'ph empty' : 'ph filled';
-            return `<span class="${cls}" data-key="${esc(s.key)}" title="${esc(s.label)}">${esc(s.v)}</span>`;
-          })
-          .join('');
-        return `<div class="ln ln-${b.kind}">${inner || '&nbsp;'}</div>`;
-      })
-      .join('');
-  }
-
-  function renderFileName(tpl, values, dateStyle) {
-    let name = '';
-    if (tpl.fileName) {
-      name = tpl.fileName.replace(PH_RE, (all, key) => {
-        const f = tpl.fieldMap.get(key.trim()) || normalizeField({ key: key.trim() });
-        return formatValue(f, values[key.trim()], dateStyle);
-      });
-    }
-    if (!name.replace(/[_\s-]/g, '')) name = `${tpl.name}_${todayIso().replace(/-/g, '')}`;
-    return name.replace(/[\\/:*?"<>|]/g, '_').replace(/_+$/, '').trim();
-  }
-
-  // =====================================================================
   // 画面
   // =====================================================================
   const $ = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+  const esc = (s) =>
+    String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
   const state = {
-    tpl: null,
-    values: {},
+    rec: null,
+    doc: null,
+    fields: [],
+    fieldMap: new Map(),
+    values: store.get('case', {}),
     dateStyle: 'wareki',
-    lastResult: null,
   };
 
   function toast(msg) {
@@ -406,51 +294,49 @@
     el.textContent = msg;
     el.classList.add('show');
     clearTimeout(toast.timer);
-    toast.timer = setTimeout(() => el.classList.remove('show'), 2400);
+    toast.timer = setTimeout(() => el.classList.remove('show'), 2600);
   }
 
   // ---------- サイドバー ----------
   function renderTemplateList() {
-    const list = $('#tpl-list');
-    const builtins = builtinTemplates;
-    const customs = customTemplates();
-    const item = (t) =>
-      `<li><button type="button" class="tpl-item${state.tpl && state.tpl.id === t.id ? ' active' : ''}" data-id="${esc(t.id)}">` +
-      `<span class="tpl-name">${esc(t.name)}</span>` +
-      (t.description ? `<span class="tpl-desc">${esc(t.description)}</span>` : '') +
+    const item = (r) =>
+      `<li><button type="button" class="tpl-item${state.rec && state.rec.id === r.id ? ' active' : ''}" data-id="${esc(r.id)}">` +
+      `<span class="tpl-name">${esc(r.name)}</span>` +
+      (r.description ? `<span class="tpl-desc">${esc(r.description)}</span>` : '') +
       `</button></li>`;
     let html = '';
-    if (builtins.length) html += `<li class="tpl-sep">標準ひな形</li>${builtins.map(item).join('')}`;
-    html += `<li class="tpl-sep">マイひな形</li>`;
-    html += customs.length
-      ? customs.map(item).join('')
-      : '<li class="tpl-none">まだありません。<br>「＋ 新しいひな形」から追加できます。</li>';
-    list.innerHTML = html;
+    if (builtinRecords.length) html += `<li class="tpl-sep">配布ひな形</li>${builtinRecords.map(item).join('')}`;
+    html += '<li class="tpl-sep">マイひな形</li>';
+    html += customRecords.length
+      ? customRecords.map(item).join('')
+      : '<li class="tpl-none">まだありません。<br>「＋ Wordからひな形を作る」で追加できます。</li>';
+    $('#tpl-list').innerHTML = html;
   }
 
-  // ---------- テンプレート選択 ----------
-  function selectTemplate(id) {
-    const tpl = findTemplate(id);
-    if (!tpl) return;
-    state.tpl = tpl;
-    state.dateStyle = store.get('dateStyle.' + tpl.id, tpl.dateStyle);
-    const draft = store.get('draft.' + tpl.id, null);
-    const remembered = store.get('remember', {});
-    const values = {};
-    for (const f of tpl.fields) {
-      if (draft && f.key in draft) values[f.key] = draft[f.key];
-      else if (f.remember && f.key in remembered) values[f.key] = remembered[f.key];
-      else if (f.default === 'today' && f.type === 'date') values[f.key] = todayIso();
-      else if (f.default !== undefined) values[f.key] = f.default;
+  // ---------- ひな形の選択 ----------
+  async function selectTemplate(id) {
+    const rec = findRecord(id);
+    if (!rec) return;
+    let doc;
+    try {
+      doc = await DocxTemplate.load(rec.bytes);
+    } catch (e) {
+      toast('ひな形を読み込めませんでした：' + e.message);
+      return;
     }
-    state.values = values;
-    store.set('lastTemplate', tpl.id);
+    state.rec = rec;
+    state.doc = doc;
+    state.fields = buildFields(doc.fields(), rec.fields);
+    state.fieldMap = new Map(state.fields.map((f) => [f.key, f]));
+    state.dateStyle = store.get('dateStyle.' + rec.id, rec.dateStyle || 'wareki');
+    applyDefaults();
+    store.set('lastTemplate', rec.id);
 
     $('#empty-state').hidden = true;
     $('#form-pane').hidden = false;
     $('#actions').hidden = false;
-    $('#tpl-title').textContent = tpl.name;
-    $('#tpl-desc').textContent = tpl.description;
+    $('#tpl-title').textContent = rec.name;
+    $('#tpl-desc').textContent = rec.description;
     $$('input[name="dateStyle"]').forEach((r) => (r.checked = r.value === state.dateStyle));
     renderTemplateList();
     renderForm();
@@ -458,20 +344,42 @@
     document.body.classList.remove('show-sidebar');
   }
 
-  // ---------- フォーム ----------
-  function fieldId(key) {
-    return 'f-' + Array.from(key).map((c) => c.charCodeAt(0).toString(36)).join('-');
+  function applyDefaults() {
+    const mem = store.get('remember', {});
+    for (const f of state.fields) {
+      if (!isEmpty(state.values[f.key])) continue;
+      if (f.remember && !isEmpty(mem[f.key])) state.values[f.key] = mem[f.key];
+      else if (f.default === 'today' && f.type === 'date') state.values[f.key] = todayIso();
+      else if (f.default !== undefined && f.default !== 'today') state.values[f.key] = f.default;
+    }
+    store.set('case', state.values);
   }
 
+  function showEmpty() {
+    state.rec = null;
+    state.doc = null;
+    $('#form-pane').hidden = true;
+    $('#actions').hidden = true;
+    $('#empty-state').hidden = false;
+    $('#paper').innerHTML = '';
+    renderTemplateList();
+  }
+
+  // ---------- フォーム ----------
+  const fieldId = (key) => 'f-' + Array.from(key).map((c) => c.charCodeAt(0).toString(36)).join('-');
+
   function renderForm() {
-    const tpl = state.tpl;
     const form = $('#form');
+    form.innerHTML = '';
+    if (!state.fields.length) {
+      form.innerHTML = '<p class="muted">このひな形にはまだ入力項目がありません。「ひな形を編集」から設定してください。</p>';
+      return;
+    }
     const groups = new Map();
-    for (const f of tpl.fields) {
+    for (const f of state.fields) {
       if (!groups.has(f.group)) groups.set(f.group, []);
       groups.get(f.group).push(f);
     }
-    form.innerHTML = '';
     for (const [group, fields] of groups) {
       const fs = document.createElement('fieldset');
       fs.innerHTML = `<legend>${esc(group)}</legend>`;
@@ -486,96 +394,96 @@
     const wrap = document.createElement('div');
     wrap.className = 'field field-' + f.type;
     wrap.dataset.key = f.key;
-
     const badges =
-      (f.required || f.type === 'checkbox' ? '' : '<span class="badge">任意</span>') +
+      (f.required ? '' : '<span class="badge">任意</span>') +
       (f.remember ? '<span class="badge badge-mem" title="入力内容を記憶して、次回から自動で入力します">記憶</span>' : '');
-
-    if (f.type === 'checkbox') {
-      wrap.innerHTML =
-        `<label class="switch"><input type="checkbox" id="${id}"${v ? ' checked' : ''}>` +
-        `<span class="switch-ui"></span><span class="switch-label">${esc(f.label)}</span>${badges}</label>`;
-    } else {
-      let control;
-      const ph = esc(f.placeholder);
-      const val = esc(v == null ? '' : v);
-      switch (f.type) {
-        case 'textarea':
-          control = `<textarea id="${id}" rows="3" placeholder="${ph}">${val}</textarea>`;
-          break;
-        case 'date':
-          control =
-            `<div class="input-row"><input type="date" id="${id}" value="${val}">` +
-            `<button type="button" class="mini" data-today="${esc(f.key)}">今日</button></div>`;
-          break;
-        case 'money':
-          control =
-            `<div class="input-row"><input type="text" inputmode="numeric" id="${id}" value="${esc(formatMoney(v))}" placeholder="${ph || '例：100000'}">` +
-            `<span class="suffix">円</span></div>`;
-          break;
-        case 'number':
-          control = `<input type="text" inputmode="decimal" id="${id}" value="${val}" placeholder="${ph}">`;
-          break;
-        case 'select':
-          control =
-            `<select id="${id}"><option value="">選択してください</option>` +
-            f.options
-              .map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`)
-              .join('') +
-            `</select>`;
-          break;
-        default:
-          control = `<input type="text" id="${id}" value="${val}" placeholder="${ph}">`;
-      }
-      wrap.innerHTML =
-        `<label for="${id}" class="field-label">${esc(f.label)}${badges}</label>` +
-        control +
-        (f.hint ? `<div class="hint">${esc(f.hint)}</div>` : '');
+    const ph = esc(f.placeholder);
+    const val = esc(v == null ? '' : v);
+    let control;
+    switch (f.type) {
+      case 'textarea':
+        control = `<textarea id="${id}" rows="3" placeholder="${ph}">${val}</textarea>`;
+        break;
+      case 'date':
+        control =
+          `<div class="input-row"><input type="date" id="${id}" value="${val}">` +
+          `<button type="button" class="mini" data-today="${esc(f.key)}">今日</button></div>`;
+        break;
+      case 'money':
+        control =
+          `<div class="input-row"><input type="text" inputmode="numeric" id="${id}" value="${esc(formatMoney(v))}" placeholder="${ph || '例：25000000'}">` +
+          `<span class="suffix">円</span></div>`;
+        break;
+      case 'number':
+        control = `<input type="text" inputmode="decimal" id="${id}" value="${val}" placeholder="${ph}">`;
+        break;
+      case 'select':
+        control =
+          `<select id="${id}"><option value="">選択してください</option>` +
+          f.options.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('') +
+          `</select>`;
+        break;
+      default:
+        control = `<input type="text" id="${id}" value="${val}" placeholder="${ph}">`;
     }
+    wrap.innerHTML =
+      `<label for="${id}" class="field-label">${esc(f.label)}${badges}</label>` +
+      control +
+      `<div class="out-preview" aria-live="polite"></div>` +
+      (f.hint ? `<div class="hint">${esc(f.hint)}</div>` : '');
     return wrap;
-  }
-
-  function readInput(el, f) {
-    if (f.type === 'checkbox') return el.checked;
-    if (f.type === 'money') return digitsOnly(el.value);
-    return el.value;
   }
 
   function onFieldInput(e) {
     const wrap = e.target.closest('.field');
-    if (!wrap || !state.tpl) return;
-    const f = state.tpl.fieldMap.get(wrap.dataset.key);
+    if (!wrap || !state.rec) return;
+    const f = state.fieldMap.get(wrap.dataset.key);
     if (!f) return;
-    setValue(f, readInput(e.target, f));
+    setValue(f, f.type === 'money' ? digitsOnly(e.target.value) : e.target.value);
   }
 
   function setValue(f, v) {
     state.values[f.key] = v;
-    store.set('draft.' + state.tpl.id, state.values);
+    store.set('case', state.values);
     if (f.remember) {
       const mem = store.get('remember', {});
       mem[f.key] = v;
       store.set('remember', mem);
     }
-    update();
+    scheduleUpdate();
   }
 
-  // ---------- プレビュー更新 ----------
-  function update() {
-    const tpl = state.tpl;
-    if (!tpl) return;
-    const result = evaluate(tpl, state.values, state.dateStyle);
-    state.lastResult = result;
-    $('#paper').innerHTML = blocksToHtml(result.blocks);
+  // ---------- プレビュー ----------
+  function valueOf(key) {
+    const f = state.fieldMap.get(key) || makeField(key);
+    const text = formatValue(f, state.values[key], state.dateStyle);
+    return { text, empty: isEmpty(state.values[key]) && f.required, label: f.markerLabel || f.label };
+  }
 
-    // 進捗
+  function scheduleUpdate() {
+    clearTimeout(scheduleUpdate.t);
+    scheduleUpdate.t = setTimeout(update, 60);
+  }
+
+  function update() {
+    if (!state.doc) return;
+    const scroll = $('.preview-pane').scrollTop;
+    $('#paper').innerHTML = state.doc.renderHtml({ mode: 'fill', value: valueOf }).html;
+    fitPage($('#paper'));
+    $('.preview-pane').scrollTop = scroll;
+
     let total = 0;
     let done = 0;
-    for (const f of tpl.fields) {
+    for (const f of state.fields) {
       const wrap = $(`.field[data-key="${CSS.escape(f.key)}"]`);
-      const used = result.used.has(f.key);
-      if (wrap) wrap.classList.toggle('unused', !used);
-      if (!used || !f.required || f.type === 'checkbox') continue;
+      const text = formatValue(f, state.values[f.key], state.dateStyle);
+      if (wrap) {
+        // 実際に差し込まれる文字をフォームにも表示（日付・金額など整形されるもの）
+        const out = $('.out-preview', wrap);
+        const shown = f.type === 'date' || f.zenkaku || f.type === 'money';
+        out.textContent = shown && !isEmpty(state.values[f.key]) ? `差し込まれる文字：${text}` : '';
+      }
+      if (!f.required) continue;
       total++;
       const filled = !isEmpty(state.values[f.key]);
       if (filled) done++;
@@ -588,12 +496,17 @@
     highlightActive();
   }
 
+  /** 画面が狭いときは、プレビューの用紙を幅に合わせて縮小表示する */
+  function fitPage(container) {
+    const page = container.querySelector('.dx-page');
+    if (!page) return;
+    page.style.zoom = '';
+    const avail = container.clientWidth;
+    if (avail && page.offsetWidth > avail) page.style.zoom = (avail / page.offsetWidth).toFixed(3);
+  }
+
   function missingLabels() {
-    if (!state.lastResult) return [];
-    const labels = [];
-    for (const b of state.lastResult.blocks)
-      for (const s of b.segs) if (s.t === 'field' && s.empty && !labels.includes(s.label)) labels.push(s.label);
-    return labels;
+    return state.fields.filter((f) => f.required && isEmpty(state.values[f.key])).map((f) => f.markerLabel);
   }
 
   function highlightActive() {
@@ -611,7 +524,7 @@
     const pane = $('.preview-pane');
     const pr = pane.getBoundingClientRect();
     const tr = target.getBoundingClientRect();
-    if (tr.top < pr.top + 40 || tr.bottom > pr.bottom - 40) {
+    if (tr.top < pr.top + 60 || tr.bottom > pr.bottom - 40) {
       pane.scrollTo({ top: pane.scrollTop + tr.top - pr.top - pr.height / 3, behavior: 'smooth' });
     }
   }
@@ -620,43 +533,22 @@
     const wrap = $(`.field[data-key="${CSS.escape(key)}"]`);
     if (!wrap) return;
     document.body.classList.remove('show-preview');
-    const input = $('input, textarea, select', wrap);
     wrap.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    input.focus({ preventScroll: true });
+    $('input, textarea, select', wrap).focus({ preventScroll: true });
     wrap.classList.add('flash');
     setTimeout(() => wrap.classList.remove('flash'), 900);
   }
 
   // =====================================================================
-  // 出力
+  // Word 出力
   // =====================================================================
-  function confirmMissing() {
-    const miss = missingLabels();
-    if (!miss.length) return true;
-    return confirm(
-      `未入力の項目が ${miss.length} 件あります。\n\n・${miss.slice(0, 8).join('\n・')}${miss.length > 8 ? '\n…ほか' : ''}\n\nこのまま出力しますか？`
-    );
-  }
-
   function currentFileName() {
-    return renderFileName(state.tpl, state.values, state.dateStyle);
-  }
-
-  function addHistory() {
-    const list = store.get('history', []);
-    const entry = {
-      id: Date.now().toString(36),
-      templateId: state.tpl.id,
-      templateName: state.tpl.name,
-      title: currentFileName(),
-      at: new Date().toISOString(),
-      dateStyle: state.dateStyle,
-      values: { ...state.values },
-    };
-    // 直前と同じ内容なら上書き
-    if (list[0] && list[0].templateId === entry.templateId && JSON.stringify(list[0].values) === JSON.stringify(entry.values)) list.shift();
-    list.unshift(entry);
-    store.set('history', list.slice(0, 100));
+    let name = '';
+    if (state.rec.fileName) {
+      name = state.rec.fileName.replace(/\{\{\s*([^{}:]+?)\s*(?::[a-z]+)?\s*\}\}/g, (all, key) => valueOf(key.trim()).text);
+    }
+    if (!name.replace(/[_\s-]/g, '')) name = `${state.rec.name}_${todayIso().replace(/-/g, '')}`;
+    return name.replace(/[\\/:*?"<>|]/g, '_').replace(/_+$/, '').trim();
   }
 
   function downloadBlob(blob, name) {
@@ -671,62 +563,85 @@
     }, 1000);
   }
 
-  function exportDocx() {
-    if (!state.tpl || !confirmMissing()) return;
-    const blob = window.DocxBuilder.build(state.lastResult.blocks);
-    downloadBlob(blob, currentFileName() + '.docx');
-    addHistory();
-    toast('Wordファイルを保存しました');
+  /** 差し込み済みの Word を作り、差し込み箇所以外の文字が変わっていないか検証する */
+  async function buildFilledDocx(rec, values, dateStyle) {
+    const src = await DocxTemplate.load(rec.bytes);
+    const fields = new Map(buildFields(src.fields(), rec.fields).map((f) => [f.key, f]));
+    const text = (key) => formatValue(fields.get(key) || makeField(key), values[key], dateStyle);
+
+    const expected = src.texts().map((t) => {
+      const phs = DocxTemplate.findPlaceholders(t);
+      let s = t;
+      for (const ph of phs.reverse()) s = s.slice(0, ph.start) + text(ph.key).replace(/\n/g, '') + s.slice(ph.end);
+      return s;
+    });
+
+    src.fill(text);
+    const blob = await src.toBlob();
+
+    const check = await DocxTemplate.load(await blob.arrayBuffer());
+    const actual = check.texts();
+    const same = actual.length === expected.length && actual.every((t, i) => t === expected[i]);
+    if (!same) throw new Error('出力内容の検証に失敗しました（差し込み以外の文字が変わる可能性があるため中止しました）');
+    return blob;
   }
 
-  function printDoc() {
-    if (!state.tpl || !confirmMissing()) return;
-    addHistory();
-    const prev = document.title;
-    document.title = currentFileName(); // PDF保存時のファイル名になる
-    window.print();
-    setTimeout(() => (document.title = prev), 500);
-  }
-
-  async function copyText() {
-    if (!state.tpl || !confirmMissing()) return;
-    const text = blocksToText(state.lastResult.blocks);
+  async function exportDocx() {
+    if (!state.rec) return;
+    const miss = missingLabels();
+    if (
+      miss.length &&
+      !confirm(
+        `未入力の項目が ${miss.length} 件あります。\n\n・${miss.slice(0, 8).join('\n・')}${miss.length > 8 ? '\n…ほか' : ''}\n\n未入力の箇所は空欄（または設定した文字）で出力されます。よろしいですか？`
+      )
+    )
+      return;
     try {
-      await navigator.clipboard.writeText(text);
+      const blob = await buildFilledDocx(state.rec, state.values, state.dateStyle);
+      downloadBlob(blob, currentFileName() + '.docx');
+      addHistory();
+      toast('Wordファイルを保存しました');
     } catch (e) {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
+      alert(e.message);
     }
-    addHistory();
-    toast('本文をコピーしました');
   }
 
   // =====================================================================
-  // 履歴
+  // 履歴・案件
   // =====================================================================
+  function addHistory() {
+    const list = store.get('history', []);
+    const entry = {
+      id: Date.now().toString(36),
+      templateId: state.rec.id,
+      templateName: state.rec.name,
+      title: currentFileName(),
+      at: new Date().toISOString(),
+      dateStyle: state.dateStyle,
+      values: { ...state.values },
+    };
+    if (list[0] && list[0].templateId === entry.templateId && JSON.stringify(list[0].values) === JSON.stringify(entry.values)) list.shift();
+    list.unshift(entry);
+    store.set('history', list.slice(0, 200));
+  }
+
   function openHistory() {
     const list = store.get('history', []);
     const box = $('#history-list');
-    if (!list.length) {
-      box.innerHTML = '<p class="muted">まだ履歴はありません。Word出力・印刷・コピーをすると自動で記録されます。</p>';
-    } else {
-      box.innerHTML = list
-        .map((h) => {
-          const d = new Date(h.at);
-          const when = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-          return (
-            `<div class="hist-item"><div class="hist-main"><div class="hist-title">${esc(h.title)}</div>` +
-            `<div class="hist-meta">${esc(h.templateName)} ・ ${when}</div></div>` +
-            `<button type="button" class="btn" data-hist-open="${h.id}">この内容で開く</button>` +
-            `<button type="button" class="btn ghost" data-hist-del="${h.id}" aria-label="削除">削除</button></div>`
-          );
-        })
-        .join('');
-    }
+    box.innerHTML = list.length
+      ? list
+          .map((h) => {
+            const d = new Date(h.at);
+            const when = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+            return (
+              `<div class="hist-item"><div class="hist-main"><div class="hist-title">${esc(h.title)}</div>` +
+              `<div class="hist-meta">${esc(h.templateName)} ・ ${when}</div></div>` +
+              `<button type="button" class="btn small" data-hist-open="${h.id}">この内容で開く</button>` +
+              `<button type="button" class="btn small ghost" data-hist-del="${h.id}">削除</button></div>`
+            );
+          })
+          .join('')
+      : '<p class="muted">まだ履歴はありません。Word出力をすると自動で記録されます。</p>';
     $('#history-dialog').showModal();
   }
 
@@ -737,81 +652,114 @@
     if (openId) {
       const h = list.find((x) => x.id === openId);
       if (!h) return;
-      if (!findTemplate(h.templateId)) return toast('このひな形は削除されています');
-      store.set('draft.' + h.templateId, h.values);
+      if (!findRecord(h.templateId)) return toast('このひな形は削除されています');
+      state.values = { ...h.values };
+      store.set('case', state.values);
       store.set('dateStyle.' + h.templateId, h.dateStyle);
       $('#history-dialog').close();
-      selectTemplate(h.templateId);
-      toast('履歴の内容を読み込みました');
+      selectTemplate(h.templateId).then(() => toast('履歴の内容を読み込みました'));
     } else if (delId) {
       store.set('history', list.filter((x) => x.id !== delId));
       openHistory();
     }
   }
 
+  function newCase() {
+    if (!confirm('入力内容をクリアして新しい案件を始めますか？\n（自社情報など「記憶」の項目は残ります。これまでの内容は履歴から呼び出せます）')) return;
+    state.values = {};
+    store.set('case', {});
+    if (state.rec) selectTemplate(state.rec.id);
+  }
+
   // =====================================================================
   // ひな形エディタ
   // =====================================================================
-  const editor = { id: null, builtinSource: false, fields: new Map(), timer: null };
+  const ed = { id: null, builtinSource: false, doc: null, fields: new Map(), undo: [], sel: null };
 
-  function openEditor(tpl) {
-    editor.id = tpl && !tpl.builtin ? tpl.id : null;
-    editor.builtinSource = !!(tpl && tpl.builtin);
-    editor.fields = new Map((tpl ? tpl.fields : []).map((f) => [f.key, { ...f }]));
-    $('#te-heading').textContent = !tpl ? '新しいひな形' : tpl.builtin ? '標準ひな形をコピーして編集' : 'ひな形の編集';
-    $('#te-note').hidden = !editor.builtinSource;
-    $('#te-name').value = tpl ? (tpl.builtin ? tpl.name + '（コピー）' : tpl.name) : '';
-    $('#te-desc').value = tpl ? tpl.description : '';
-    $('#te-filename').value = tpl ? tpl.fileName : '';
-    $('#te-body').value = tpl
-      ? tpl.body
-      : '# 〇〇契約書\n\n{{甲_名称}}（以下「甲」という。）と{{乙_名称}}（以下「乙」という。）は、次のとおり契約を締結する。\n\n## 第{{条}}条（目的）\nここに本文を書きます。\n\n{{契約日:date}}\n\n> 甲　{{甲_名称}}\n> 乙　{{乙_名称}}\n';
-    $('#te-delete').hidden = !editor.id;
-    $('#te-export').hidden = !tpl;
-    renderEditorFields();
+  async function openEditorFromFile(file) {
+    if (!/\.docx$/i.test(file.name)) {
+      toast('.docx 形式の Word ファイルを選んでください（.doc の場合は Word で .docx に保存し直してください）');
+      return;
+    }
+    try {
+      const buf = await file.arrayBuffer();
+      const doc = await DocxTemplate.load(buf);
+      openEditor({ doc, name: file.name.replace(/\.docx$/i, '') });
+    } catch (e) {
+      toast('Wordファイルを読み込めませんでした：' + e.message);
+    }
+  }
+
+  async function openEditorFromRecord(rec) {
+    const doc = await DocxTemplate.load(rec.bytes);
+    openEditor({ doc, rec });
+  }
+
+  function openEditor({ doc, rec, name }) {
+    ed.id = rec && !rec.builtin ? rec.id : null;
+    ed.builtinSource = !!(rec && rec.builtin);
+    ed.doc = doc;
+    ed.undo = [];
+    ed.fields = new Map(buildFields(doc.fields(), rec ? rec.fields : []).map((f) => [f.key, f]));
+    $('#te-heading').textContent = !rec ? 'Wordからひな形を作る' : rec.builtin ? '配布ひな形をコピーして編集' : 'ひな形の編集';
+    $('#te-note').hidden = !ed.builtinSource;
+    $('#te-name').value = rec ? (rec.builtin ? rec.name + '（コピー）' : rec.name) : name || '';
+    $('#te-desc').value = rec ? rec.description : '';
+    $('#te-filename').value = rec ? rec.fileName : '';
+    $('#te-delete').hidden = !ed.id;
+    renderEditor();
     $('#tpl-editor').showModal();
-    $('#te-name').focus();
+  }
+
+  function renderEditor() {
+    const scroll = $('.te-doc-wrap').scrollTop;
+    $('#te-doc').innerHTML = ed.doc.renderHtml({ mode: 'raw' }).html;
+    fitPage($('#te-doc'));
+    $('.te-doc-wrap').scrollTop = scroll;
+    $('#te-undo').disabled = !ed.undo.length;
+    $('#te-pop').hidden = true;
+    renderEditorFields();
   }
 
   function renderEditorFields() {
-    const body = $('#te-body').value;
-    const detected = detectFields(body);
+    const detected = ed.doc.fields();
+    $('#te-count').textContent = detected.length ? `${detected.length} 項目` : '';
     const box = $('#te-fields');
     if (!detected.length) {
-      box.innerHTML = '<p class="muted">本文に <code>{{項目名}}</code> を書くと、ここに入力項目が表示されます。</p>';
+      box.innerHTML =
+        '<p class="muted">左の文書で、毎回変わる文字（お客様名・金額・日付など）をドラッグで選択してください。<br><br>' +
+        'Word 上であらかじめ <code>{{注文者_氏名}}</code> のように書いておいた箇所も自動で入力項目になります。</p>';
       return;
     }
-    const groups = new Set([DEFAULT_GROUP]);
-    editor.fields.forEach((f) => groups.add(f.group));
+    const groups = new Set([DEFAULT_GROUP, ...PRESETS.map((p) => p.group)]);
+    ed.fields.forEach((f) => groups.add(f.group));
     $('#te-groups').innerHTML = Array.from(groups).map((g) => `<option value="${esc(g)}">`).join('');
 
     box.innerHTML = detected
       .map((d) => {
-        let f = editor.fields.get(d.key);
-        if (!f) {
-          f = normalizeField({ key: d.key }, d.type);
-          editor.fields.set(d.key, f);
-        } else if (d.type !== 'text' && f.type === 'text') {
-          f.type = d.type;
-        }
+        let f = ed.fields.get(d.key);
+        if (!f) ed.fields.set(d.key, (f = makeField(d.key, d.type)));
         const k = esc(d.key);
+        const numeric = NUMERIC_TYPES.includes(f.type);
         return (
           `<div class="te-field" data-key="${k}">` +
-          `<div class="te-field-head"><code>{{${k}}}</code></div>` +
+          `<div class="te-field-head"><code>{{${k}}}</code>` +
+          (f.sample ? `<span class="te-sample" title="元の文字">元：${esc(f.sample)}</span>` : '') +
+          `<button type="button" class="link-btn te-unmark" data-unmark="${k}">解除</button></div>` +
           `<div class="te-grid">` +
           `<label>表示名<input data-prop="label" value="${esc(f.label)}"></label>` +
           `<label>種類<select data-prop="type">${Object.entries(TYPE_LABELS)
             .map(([v, l]) => `<option value="${v}"${v === f.type ? ' selected' : ''}>${l}</option>`)
             .join('')}</select></label>` +
           `<label>グループ<input data-prop="group" list="te-groups" value="${esc(f.group)}"></label>` +
-          `<label class="te-options"${f.type === 'select' ? '' : ' hidden'}>選択肢（カンマ区切り）<input data-prop="options" value="${esc(f.options.join(','))}"></label>` +
+          `<label class="te-wide"${f.type === 'select' ? '' : ' hidden'}>選択肢（カンマ区切り）<input data-prop="options" value="${esc(f.options.join(','))}"></label>` +
           `<label class="te-wide">補足説明<input data-prop="hint" value="${esc(f.hint)}" placeholder="入力欄の下に表示されます"></label>` +
+          `<label class="te-wide">未入力のときに入れる文字<input data-prop="blank" value="${esc(f.blank)}" placeholder="空欄のまま（例：全角スペース、―）"></label>` +
           `</div><div class="te-checks">` +
           `<label><input type="checkbox" data-prop="required"${f.required ? ' checked' : ''}> 必須</label>` +
           `<label><input type="checkbox" data-prop="remember"${f.remember ? ' checked' : ''}> 入力を記憶（自社情報など）</label>` +
-          (f.type === 'date'
-            ? `<label><input type="checkbox" data-prop="today"${f.default === 'today' ? ' checked' : ''}> 初期値を今日にする</label>`
-            : '') +
+          (numeric ? `<label><input type="checkbox" data-prop="zenkaku"${f.zenkaku ? ' checked' : ''}> 数字を全角にする</label>` : '') +
+          (f.type === 'date' ? `<label><input type="checkbox" data-prop="today"${f.default === 'today' ? ' checked' : ''}> 初期値を今日にする</label>` : '') +
           `</div></div>`
         );
       })
@@ -823,101 +771,205 @@
     const prop = el.dataset.prop;
     const card = el.closest('.te-field');
     if (!prop || !card) return;
-    const f = editor.fields.get(card.dataset.key);
+    const f = ed.fields.get(card.dataset.key);
     if (!f) return;
-    if (prop === 'required' || prop === 'remember') f[prop] = el.checked;
+    if (prop === 'required' || prop === 'remember' || prop === 'zenkaku') f[prop] = el.checked;
     else if (prop === 'today') f.default = el.checked ? 'today' : undefined;
     else if (prop === 'options') f.options = el.value.split(/[,、]/).map((s) => s.trim()).filter(Boolean);
     else f[prop] = el.value;
-    if (prop === 'type') {
-      if (f.type === 'checkbox') f.required = false;
-      renderEditorFields();
+    if (prop === 'type') renderEditorFields();
+  }
+
+  // ---------- 文字の選択 → 入力項目にする ----------
+  function offsetInPara(pEl, node, offset) {
+    const r = document.createRange();
+    r.setStart(pEl, 0);
+    r.setEnd(node, offset);
+    let n = 0;
+    r.cloneContents()
+      .querySelectorAll('[data-t]')
+      .forEach((s) => (n += s.textContent.length));
+    return n;
+  }
+
+  function readSelection() {
+    const sel = window.getSelection();
+    if (!sel.rangeCount || sel.isCollapsed) return null;
+    const range = sel.getRangeAt(0);
+    const root = $('#te-doc');
+    if (!root.contains(range.commonAncestorContainer)) return null;
+    const elOf = (n) => (n.nodeType === 1 ? n : n.parentElement);
+    const p1 = elOf(range.startContainer).closest('[data-pid]');
+    const p2 = elOf(range.endContainer).closest('[data-pid]');
+    if (!p1 || p1 !== p2) return { error: '1つの段落（行のまとまり）の中で選択してください' };
+    const s = offsetInPara(p1, range.startContainer, range.startOffset);
+    const e = offsetInPara(p1, range.endContainer, range.endOffset);
+    if (e <= s) return null;
+    const p = ed.doc.paragraphById(+p1.dataset.pid);
+    const text = DocxTemplate.paraText(p);
+    const phs = DocxTemplate.findPlaceholders(text);
+    if (phs.some((ph) => s < ph.end && e > ph.start)) return { error: 'すでに入力項目になっている部分が含まれています' };
+    return { p, s, e, text: text.slice(s, e), rect: range.getBoundingClientRect() };
+  }
+
+  function onDocMouseUp() {
+    setTimeout(() => {
+      const sel = readSelection();
+      const pop = $('#te-pop');
+      if (!sel || sel.error) {
+        pop.hidden = true;
+        ed.sel = null;
+        if (sel && sel.error) toast(sel.error);
+        return;
+      }
+      ed.sel = sel;
+      const wrap = $('.te-doc-wrap').getBoundingClientRect();
+      pop.style.top = sel.rect.bottom - wrap.top + $('.te-doc-wrap').scrollTop + 6 + 'px';
+      pop.style.left = Math.max(8, sel.rect.left - wrap.left) + 'px';
+      pop.hidden = false;
+    }, 0);
+  }
+
+  function openMarkDialog() {
+    const sel = ed.sel;
+    if (!sel) return;
+    $('#mark-text').textContent = sel.text;
+    const count = ed.doc.countText(sel.text);
+    $('#mark-all-count').textContent = count;
+    $('#mark-all-wrap').hidden = count < 2;
+    $('#mark-all').checked = true;
+    const used = new Set(ed.doc.fields().map((f) => f.key));
+    // 既に同じ元の文字で作った項目があれば、それを初期値にする
+    const same = Array.from(ed.fields.values()).find((f) => f.sample === sel.text && used.has(f.key));
+    $('#mark-key').value = same ? same.key : '';
+    const keys = new Set([...used, ...PRESETS.map((p) => p.key)]);
+    $('#mark-keys').innerHTML = Array.from(keys)
+      .map((k) => `<option value="${esc(k)}">${esc((PRESET_MAP.get(k) || ed.fields.get(k) || {}).label || '')}</option>`)
+      .join('');
+    const groups = new Map();
+    if (used.size) groups.set('このひな形の項目', Array.from(used).map((k) => ({ key: k, label: (ed.fields.get(k) || {}).label || k })));
+    for (const p of PRESETS) {
+      if (!groups.has(p.group)) groups.set(p.group, []);
+      groups.get(p.group).push(p);
+    }
+    $('#mark-presets').innerHTML =
+      '<p class="muted">よく使う項目（クリックで選択）</p>' +
+      Array.from(groups)
+        .map(
+          ([g, list]) =>
+            `<div class="chip-group"><span class="chip-group-name">${esc(g)}</span>` +
+            list.map((p) => `<button type="button" class="chip" data-key="${esc(p.key)}" title="${esc(p.key)}">${esc(p.label)}</button>`).join('') +
+            `</div>`
+        )
+        .join('');
+    $('#te-pop').hidden = true;
+    $('#mark-dialog').showModal();
+    $('#mark-key').focus();
+  }
+
+  function confirmMark() {
+    const sel = ed.sel;
+    const key = $('#mark-key').value.trim().replace(/[{}:]/g, '');
+    if (!sel) return;
+    if (!key) {
+      $('#mark-key').focus();
+      return toast('項目名を入力してください');
+    }
+    ed.undo.push(ed.doc.snapshot());
+    if ($('#mark-all').checked && !$('#mark-all-wrap').hidden) ed.doc.markAll(sel.text, key);
+    else ed.doc.markRange(sel.p, sel.s, sel.e, key);
+    if (!ed.fields.has(key)) ed.fields.set(key, makeField(key, '', { sample: sel.text }));
+    else if (!ed.fields.get(key).sample) ed.fields.get(key).sample = sel.text;
+    ed.sel = null;
+    window.getSelection().removeAllRanges();
+    $('#mark-dialog').close();
+    renderEditor();
+    const card = $(`.te-field[data-key="${CSS.escape(key)}"]`);
+    if (card) {
+      card.scrollIntoView({ block: 'nearest' });
+      card.classList.add('flash');
+      setTimeout(() => card.classList.remove('flash'), 900);
     }
   }
 
-  function editorTemplate() {
-    const body = $('#te-body').value;
-    const keys = new Set(detectFields(body).map((d) => d.key));
-    const fields = Array.from(editor.fields.values()).filter((f) => keys.has(f.key));
-    return normalizeTemplate(
-      {
-        id: editor.id || 'custom-' + Date.now().toString(36),
-        name: $('#te-name').value.trim(),
-        description: $('#te-desc').value.trim(),
-        fileName: $('#te-filename').value.trim(),
-        body,
-        fields,
-      },
-      false
-    );
+  function unmark(key) {
+    const f = ed.fields.get(key);
+    const back = f && f.sample ? f.sample : '';
+    if (!back && !confirm(`{{${key}}} の元の文字が分からないため、この箇所は空欄になります。解除しますか？`)) return;
+    ed.undo.push(ed.doc.snapshot());
+    ed.doc.fill((k) => (k === key ? back : null));
+    renderEditor();
   }
 
-  function saveEditor() {
+  function undo() {
+    const snap = ed.undo.pop();
+    if (!snap) return;
+    ed.doc.restore(snap);
+    renderEditor();
+  }
+
+  async function editorRecord() {
+    const detected = ed.doc.fields();
+    const fields = buildFields(detected, ed.fields).map(serializeField);
+    return {
+      id: ed.id || 'custom-' + Date.now().toString(36),
+      name: $('#te-name').value.trim() || '無題のひな形',
+      description: $('#te-desc').value.trim(),
+      fileName: $('#te-filename').value.trim(),
+      dateStyle: 'wareki',
+      fields,
+      bytes: await ed.doc.toArrayBuffer(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  async function saveEditor() {
     if (!$('#te-name').value.trim()) {
       $('#te-name').focus();
       return toast('ひな形の名前を入力してください');
     }
-    const t = editorTemplate();
-    saveCustomTemplate(t);
+    const rec = await editorRecord();
+    try {
+      await idb.put(rec);
+    } catch (e) {
+      return alert('保存できませんでした：' + e.message);
+    }
+    await reloadCustoms();
     $('#tpl-editor').close();
-    renderTemplateList();
-    selectTemplate(t.id);
+    await selectTemplate(rec.id);
     toast('ひな形を保存しました');
   }
 
-  function makeFieldFromSelection() {
-    const ta = $('#te-body');
-    const { selectionStart: s, selectionEnd: e, value } = ta;
-    const selected = value.slice(s, e);
-    const name = prompt(
-      selected ? `「${selected.slice(0, 30)}」を入力項目に置き換えます。\n項目名を入力してください（例：乙_名称）` : '挿入する入力項目の名前を入力してください（例：乙_名称）'
-    );
-    if (!name || !name.trim()) return;
-    const key = name.trim().replace(/[{}#\/:]/g, '');
-    const token = `{{${key}}}`;
-    ta.setRangeText(token, s, e, 'end');
-    // 同じ文言が他にもあれば一括置換するか確認
-    if (selected && selected.length >= 2 && ta.value.includes(selected)) {
-      const count = ta.value.split(selected).length - 1;
-      if (confirm(`本文の他の場所にも「${selected.slice(0, 30)}」が ${count} 箇所あります。すべて {{${key}}} に置き換えますか？`)) {
-        ta.value = ta.value.split(selected).join(token);
-      }
-    }
-    ta.focus();
-    renderEditorFields();
+  // ---------- 書き出し・読み込み ----------
+  function exportJson(recs, name) {
+    downloadBlob(new Blob([JSON.stringify(bundleOf(recs))], { type: 'application/json' }), name + '.json');
   }
 
-  function insertAtCursor(text) {
-    const ta = $('#te-body');
-    ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, 'end');
-    ta.focus();
-    renderEditorFields();
+  function exportJs(recs, name) {
+    const js =
+      '/* 契約書メーカー 配布ひな形（このファイルを templates/ に置き、index.html に <script> を1行追加） */\n' +
+      'ContractApp.registerBundle(' +
+      JSON.stringify(bundleOf(recs)) +
+      ');\n';
+    downloadBlob(new Blob([js], { type: 'text/javascript' }), name + '.js');
   }
 
-  // ---------- 読み込み / 書き出し ----------
-  function exportTemplates(templates, name) {
-    const data = {
-      format: 'contract-maker-templates',
-      version: 1,
-      templates: templates.map(serializeTemplate),
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    downloadBlob(blob, name + '.json');
-  }
-
-  async function importTemplates(file) {
+  async function importFile(file) {
+    if (/\.docx$/i.test(file.name)) return openEditorFromFile(file);
     try {
-      const data = JSON.parse(await file.text());
-      const list = Array.isArray(data) ? data : data.templates || (data.template ? [data.template] : [data]);
+      let text = await file.text();
+      text = text.replace(/^\s*\/\*[\s\S]*?\*\/\s*/, '').replace(/^\s*ContractApp\.registerBundle\(/, '').replace(/\);?\s*$/, '');
+      const data = JSON.parse(text);
       let n = 0;
-      const existing = new Set(allTemplates().map((t) => t.id));
-      for (const raw of list) {
-        if (!raw || typeof raw.body !== 'string') continue;
-        const t = normalizeTemplate(raw, false);
-        if (existing.has(t.id) && builtinTemplates.some((b) => b.id === t.id)) t.id = 'custom-' + Date.now().toString(36) + n;
-        saveCustomTemplate(t);
+      for (const t of data.templates || []) {
+        if (!t || !t.docx) continue;
+        const rec = recordFromBundle(t, false);
+        if (builtinRecords.some((b) => b.id === rec.id)) rec.id = 'custom-' + Date.now().toString(36) + n;
+        await DocxTemplate.load(rec.bytes); // 壊れていないか確認
+        await idb.put({ ...rec, builtin: undefined, updatedAt: new Date().toISOString() });
         n++;
       }
+      await reloadCustoms();
       renderTemplateList();
       toast(n ? `${n} 件のひな形を読み込みました` : '読み込めるひな形がありませんでした');
     } catch (e) {
@@ -928,7 +980,8 @@
   // =====================================================================
   // 初期化
   // =====================================================================
-  function init() {
+  async function init() {
+    await reloadCustoms();
     renderTemplateList();
 
     $('#tpl-list').addEventListener('click', (e) => {
@@ -942,11 +995,9 @@
     form.addEventListener('focusin', onFieldFocus);
     form.addEventListener('focusout', (e) => {
       setTimeout(highlightActive, 0);
-      const wrap = e.target.closest('.field-money');
-      if (wrap) e.target.value = formatMoney(e.target.value);
+      if (e.target.closest('.field-money')) e.target.value = formatMoney(e.target.value);
     });
     form.addEventListener('submit', (e) => e.preventDefault());
-    // Enter で次の項目へ
     form.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' || e.isComposing || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'BUTTON') return;
       e.preventDefault();
@@ -957,10 +1008,9 @@
     form.addEventListener('click', (e) => {
       const key = e.target.dataset.today;
       if (!key) return;
-      const f = state.tpl.fieldMap.get(key);
       const input = $('input', e.target.closest('.field'));
       input.value = todayIso();
-      setValue(f, input.value);
+      setValue(state.fieldMap.get(key), input.value);
     });
 
     $('#paper').addEventListener('click', (e) => {
@@ -971,84 +1021,102 @@
     $$('input[name="dateStyle"]').forEach((r) =>
       r.addEventListener('change', () => {
         state.dateStyle = r.value;
-        store.set('dateStyle.' + state.tpl.id, r.value);
+        store.set('dateStyle.' + state.rec.id, r.value);
         update();
       })
     );
 
-    $('#btn-clear').addEventListener('click', () => {
-      if (!confirm('入力内容をクリアしますか？（「記憶」の項目は残ります）')) return;
-      store.del('draft.' + state.tpl.id);
-      selectTemplate(state.tpl.id);
-    });
     $('#btn-docx').addEventListener('click', exportDocx);
-    $('#btn-print').addEventListener('click', printDoc);
-    $('#btn-copy').addEventListener('click', copyText);
     $('#btn-history').addEventListener('click', openHistory);
+    $('#btn-new-case').addEventListener('click', newCase);
     $('#history-list').addEventListener('click', onHistoryClick);
     $('#btn-toggle-preview').addEventListener('click', () => document.body.classList.toggle('show-preview'));
     $('#btn-menu').addEventListener('click', () => document.body.classList.toggle('show-sidebar'));
 
-    $('#btn-new-tpl').addEventListener('click', () => openEditor(null));
-    $('#btn-edit-tpl').addEventListener('click', () => openEditor(state.tpl));
-    $('#btn-import').addEventListener('click', () => $('#import-file').click());
-    $('#import-file').addEventListener('change', (e) => {
-      if (e.target.files[0]) importTemplates(e.target.files[0]);
+    $('#btn-new-tpl').addEventListener('click', () => $('#file-docx').click());
+    $('#file-docx').addEventListener('change', (e) => {
+      if (e.target.files[0]) openEditorFromFile(e.target.files[0]);
+      e.target.value = '';
+    });
+    $('#btn-edit-tpl').addEventListener('click', () => openEditorFromRecord(state.rec));
+    $('#btn-import').addEventListener('click', () => $('#file-import').click());
+    $('#file-import').addEventListener('change', (e) => {
+      if (e.target.files[0]) importFile(e.target.files[0]);
       e.target.value = '';
     });
     $('#btn-export-all').addEventListener('click', () => {
-      const customs = customTemplates();
-      if (!customs.length) return toast('書き出すマイひな形がありません');
-      exportTemplates(customs, 'マイひな形_' + todayIso().replace(/-/g, ''));
+      if (!customRecords.length) return toast('書き出すマイひな形がありません');
+      exportJson(customRecords, 'マイひな形_' + todayIso().replace(/-/g, ''));
     });
 
     // エディタ
-    $('#te-body').addEventListener('input', () => {
-      clearTimeout(editor.timer);
-      editor.timer = setTimeout(renderEditorFields, 300);
+    $('#te-doc').addEventListener('mouseup', onDocMouseUp);
+    $('#te-doc').addEventListener('keyup', onDocMouseUp);
+    $('#te-doc').addEventListener('click', (e) => {
+      const tok = e.target.closest('.tok');
+      if (!tok || !window.getSelection().isCollapsed) return;
+      const card = $(`.te-field[data-key="${CSS.escape(tok.dataset.key)}"]`);
+      if (card) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        card.classList.add('flash');
+        setTimeout(() => card.classList.remove('flash'), 900);
+      }
     });
+    $('#te-pop').addEventListener('mousedown', (e) => e.preventDefault());
+    $('#te-pop').addEventListener('click', openMarkDialog);
+    $('#te-undo').addEventListener('click', undo);
     $('#te-fields').addEventListener('input', onEditorFieldChange);
     $('#te-fields').addEventListener('change', onEditorFieldChange);
-    $('#te-save').addEventListener('click', saveEditor);
-    $('#te-make-field').addEventListener('click', makeFieldFromSelection);
-    $('#te-insert-article').addEventListener('click', () => insertAtCursor('## 第{{条}}条（見出し）\n'));
-    $('#te-insert-if').addEventListener('click', () => {
-      const ta = $('#te-body');
-      const sel = ta.value.slice(ta.selectionStart, ta.selectionEnd) || 'ONのときだけ表示する文章';
-      const name = prompt('ON/OFF 項目の名前を入力してください（例：自動更新あり）');
-      if (!name || !name.trim()) return;
-      insertAtCursor(`{{#if ${name.trim()}}}${sel}{{/if}}`);
+    $('#te-fields').addEventListener('click', (e) => {
+      if (e.target.dataset.unmark) unmark(e.target.dataset.unmark);
     });
-    $('#te-delete').addEventListener('click', () => {
-      if (!editor.id || !confirm('このひな形を削除しますか？（元に戻せません）')) return;
-      deleteCustomTemplate(editor.id);
-      store.del('draft.' + editor.id);
+    $('#te-save').addEventListener('click', saveEditor);
+    $('#te-delete').addEventListener('click', async () => {
+      if (!ed.id || !confirm('このひな形を削除しますか？（元に戻せません）')) return;
+      await idb.del(ed.id);
+      await reloadCustoms();
       $('#tpl-editor').close();
-      if (state.tpl && state.tpl.id === editor.id) {
-        state.tpl = null;
-        $('#form-pane').hidden = true;
-        $('#actions').hidden = true;
-        $('#empty-state').hidden = false;
-        $('#paper').innerHTML = '';
-      }
-      renderTemplateList();
+      if (state.rec && state.rec.id === ed.id) showEmpty();
+      else renderTemplateList();
       toast('ひな形を削除しました');
     });
-    $('#te-export').addEventListener('click', () => {
-      const t = editorTemplate();
-      exportTemplates([t], t.name || 'ひな形');
+    $('#te-export').addEventListener('click', async () => {
+      const rec = await editorRecord();
+      exportJson([rec], rec.name);
+    });
+    $('#te-export-js').addEventListener('click', async () => {
+      const rec = await editorRecord();
+      exportJs([rec], rec.name);
+    });
+
+    $('#mark-ok').addEventListener('click', confirmMark);
+    $('#mark-key').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault();
+        confirmMark();
+      }
+    });
+    $('#mark-presets').addEventListener('click', (e) => {
+      const chip = e.target.closest('.chip');
+      if (!chip) return;
+      $('#mark-key').value = chip.dataset.key;
+      $$('.chip', $('#mark-presets')).forEach((c) => c.classList.toggle('selected', c === chip));
     });
     $$('[data-close]').forEach((b) => b.addEventListener('click', () => b.closest('dialog').close()));
+    window.addEventListener('resize', () => {
+      fitPage($('#paper'));
+      if ($('#tpl-editor').open) fitPage($('#te-doc'));
+    });
+    $('#btn-toggle-preview').addEventListener('click', () => setTimeout(() => fitPage($('#paper')), 0));
 
     const last = store.get('lastTemplate', null);
-    if (last && findTemplate(last)) selectTemplate(last);
-    else if (builtinTemplates.length) selectTemplate(builtinTemplates[0].id);
+    if (last && findRecord(last)) await selectTemplate(last);
+    else if (allRecords().length) await selectTemplate(allRecords()[0].id);
   }
 
   window.ContractApp = {
-    register,
-    // テスト・拡張用
-    _internal: { normalizeTemplate, evaluate, blocksToText, formatDate, formatMoney, detectFields },
+    registerBundle,
+    _internal: { formatDate, formatMoney, toZenkaku, buildFilledDocx, makeField, buildFields },
   };
 
   document.addEventListener('DOMContentLoaded', init);
