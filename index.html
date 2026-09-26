@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>契約書メーカー</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button type="button" id="btn-menu" class="icon-btn only-narrow" aria-label="ひな形一覧">☰</button>
+    <div class="brand">
+      <span class="brand-mark">契</span>
+      <span class="brand-name">契約書メーカー</span>
+    </div>
+    <div class="actions" id="actions" hidden>
+      <button type="button" class="btn ghost" id="btn-history">履歴</button>
+      <button type="button" class="btn ghost hide-narrow" id="btn-copy">テキストをコピー</button>
+      <button type="button" class="btn" id="btn-docx">Word出力</button>
+      <button type="button" class="btn primary" id="btn-print">印刷 / PDF</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- ひな形一覧 -->
+    <aside class="sidebar">
+      <ul id="tpl-list" class="tpl-list"></ul>
+      <div class="side-actions">
+        <button type="button" class="btn block" id="btn-new-tpl">＋ 新しいひな形</button>
+        <button type="button" class="btn ghost block" id="btn-import">ひな形ファイルを読み込む</button>
+        <button type="button" class="link-btn" id="btn-export-all">マイひな形をすべて書き出す</button>
+        <input type="file" id="import-file" accept=".json,application/json" hidden>
+      </div>
+    </aside>
+
+    <!-- 入力フォーム -->
+    <main class="editor">
+      <div id="empty-state" class="empty-state">
+        <p>左の一覧からひな形を選んでください。</p>
+      </div>
+      <section id="form-pane" hidden>
+        <div class="form-head">
+          <h1 id="tpl-title"></h1>
+          <p id="tpl-desc" class="muted"></p>
+          <div id="progress" class="progress">
+            <div class="progress-bar"><span id="progress-bar"></span></div>
+            <span id="progress-text"></span>
+          </div>
+          <div class="form-tools">
+            <div class="segmented" role="radiogroup" aria-label="日付の表記">
+              <label><input type="radio" name="dateStyle" value="wareki"><span>和暦</span></label>
+              <label><input type="radio" name="dateStyle" value="seireki"><span>西暦</span></label>
+            </div>
+            <span class="spacer"></span>
+            <button type="button" class="link-btn" id="btn-edit-tpl">ひな形を編集</button>
+            <button type="button" class="link-btn" id="btn-clear">入力をクリア</button>
+          </div>
+        </div>
+        <form id="form" autocomplete="off"></form>
+      </section>
+    </main>
+
+    <!-- プレビュー -->
+    <section class="preview-pane" aria-label="プレビュー">
+      <article class="paper" id="paper"></article>
+    </section>
+  </div>
+
+  <button type="button" id="btn-toggle-preview" class="btn primary floating only-narrow">プレビュー ⇄ 入力</button>
+
+  <!-- ひな形エディタ -->
+  <dialog id="tpl-editor" class="modal modal-lg">
+    <div class="modal-head">
+      <h2 id="te-heading">ひな形の編集</h2>
+      <button type="button" class="icon-btn" data-close aria-label="閉じる">×</button>
+    </div>
+    <div class="modal-body te-layout">
+      <div class="te-left">
+        <p id="te-note" class="note" hidden>標準ひな形は直接変更できないため、「マイひな形」にコピーとして保存されます。</p>
+        <div class="te-meta">
+          <label>ひな形の名前<input id="te-name" placeholder="例：業務委託契約書（A社向け）"></label>
+          <label>説明（任意）<input id="te-desc" placeholder="一覧に表示される短い説明"></label>
+          <label class="te-wide">保存時のファイル名（任意）<input id="te-filename" placeholder="例：業務委託契約書_{{乙_名称}}"></label>
+        </div>
+        <div class="te-toolbar">
+          <button type="button" class="btn small" id="te-make-field">選択した文字を入力項目にする</button>
+          <button type="button" class="btn small ghost" id="te-insert-article">第○条を挿入</button>
+          <button type="button" class="btn small ghost" id="te-insert-if">ON/OFFで出し分け</button>
+        </div>
+        <textarea id="te-body" spellcheck="false" aria-label="本文"></textarea>
+        <details class="help">
+          <summary>本文の書き方</summary>
+          <table>
+            <tr><td><code>{{乙_名称}}</code></td><td>入力項目。同じ名前はすべて同じ値が入ります</td></tr>
+            <tr><td><code>{{契約日:date}}</code></td><td>種類を指定（date 日付 / money 金額 / textarea 複数行 / number 数値 / select 選択肢）</td></tr>
+            <tr><td><code># タイトル</code></td><td>中央・大きい文字のタイトル</td></tr>
+            <tr><td><code>## 第{{条}}条（目的）</code></td><td>太字の見出し。<code>{{条}}</code> は条番号を自動で振ります</td></tr>
+            <tr><td><code>&gt; 甲　住所…</code></td><td>右寄りに字下げ（署名欄）</td></tr>
+            <tr><td><code>&gt;&gt; 文字</code></td><td>右寄せ</td></tr>
+            <tr><td><code>{{#if 自動更新}}…{{else}}…{{/if}}</code></td><td>ON/OFF で文章を出し分け</td></tr>
+            <tr><td><code>===</code></td><td>改ページ</td></tr>
+          </table>
+          <p class="muted">Word の契約書をそのまま貼り付け、変わる部分を選択して「選択した文字を入力項目にする」を押すのが一番簡単です。</p>
+        </details>
+      </div>
+      <div class="te-right">
+        <h3>入力項目 <small class="muted">本文の {{…}} から自動で作られます</small></h3>
+        <datalist id="te-groups"></datalist>
+        <div id="te-fields"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button type="button" class="btn danger ghost" id="te-delete">削除</button>
+      <button type="button" class="btn ghost" id="te-export">ファイルに書き出す</button>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" data-close>キャンセル</button>
+      <button type="button" class="btn primary" id="te-save">保存</button>
+    </div>
+  </dialog>
+
+  <!-- 履歴 -->
+  <dialog id="history-dialog" class="modal">
+    <div class="modal-head">
+      <h2>作成履歴</h2>
+      <button type="button" class="icon-btn" data-close aria-label="閉じる">×</button>
+    </div>
+    <div class="modal-body" id="history-list"></div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="js/docx.js"></script>
+  <script src="js/app.js"></script>
+  <!-- 標準ひな形：ファイルを templates/ に追加したら、ここに1行足す -->
+  <script src="templates/gyomu-itaku.js"></script>
+  <script src="templates/nda.js"></script>
+  <script src="templates/baibai.js"></script>
+</body>
+</html>
