@@ -112,6 +112,33 @@
     writeText(ts[si], ts[si].textContent.slice(0, so) + text);
   }
 
+  /** 段落を差し込んだ結果（文字列・段落削除の有無）を、文書を変更せずに計算する */
+  function planParagraph(p, valueOf, dropKeys) {
+    const text = paraText(p);
+    const phs = findPlaceholders(text);
+    let out = text;
+    let changed = false;
+    let dropCandidate = false;
+    for (const ph of phs.slice().reverse()) {
+      const v = valueOf(ph.key);
+      if (v == null) continue;
+      changed = true;
+      if (v === '' && dropKeys && dropKeys.has(ph.key)) dropCandidate = true;
+      out = out.slice(0, ph.start) + String(v).replace(/\n/g, '') + out.slice(ph.end);
+    }
+    // 「未入力のとき行ごと削除」に設定された項目が空欄なら、その段落を削除する
+    const drop = dropCandidate && canDrop(p);
+    return { text: out, phs, changed, drop };
+  }
+
+  /** 段落を削除しても文書構造が壊れないか（表のセル内の最後の段落・セクション区切りは残す） */
+  function canDrop(p) {
+    const parent = p.parentNode;
+    if (child(child(p, 'pPr'), 'sectPr')) return false;
+    if (isW(parent, 'tc') || isW(parent, 'txbxContent')) return children(parent, 'p').length > 1;
+    return isW(parent, 'body') || isW(parent, 'hdr') || isW(parent, 'ftr') || isW(parent, 'sdtContent');
+  }
+
   function findPlaceholders(text) {
     const out = [];
     let m;
@@ -233,19 +260,39 @@
       return n;
     }
 
-    /** {{key}} を別の文字に置き換える（valueOf(key) が文字列を返す）。差し込み・項目解除の両方で使う */
-    fill(valueOf) {
+    /**
+     * {{key}} を別の文字に置き換える（valueOf(key) が文字列を返す。null は置き換えない）。
+     * 差し込み・項目解除の両方で使う。
+     * dropKeys に含まれる項目（「未入力のとき行ごと削除」）が空欄なら、その段落ごと削除する
+     * （例：「( ポーチ・バルコニー ○○㎡ )」の行。ひな形で設定した項目だけが対象）。
+     */
+    fill(valueOf, dropKeys) {
+      const remove = [];
       for (const { p } of this.paragraphs()) {
-        const phs = findPlaceholders(paraText(p));
-        let changed = false;
-        for (const ph of phs.reverse()) {
+        const plan = planParagraph(p, valueOf, dropKeys);
+        if (!plan.changed) continue;
+        for (const ph of plan.phs.reverse()) {
           const v = valueOf(ph.key);
           if (v == null) continue;
           replaceRange(p, ph.start, ph.end, String(v));
-          changed = true;
         }
-        if (changed) this.markDirty(p);
+        this.markDirty(p);
+        if (plan.drop) remove.push(p);
       }
+      for (const p of remove) {
+        this.markDirty(p);
+        p.parentNode.removeChild(p);
+      }
+    }
+
+    /** fill 後に残る段落の文字列（出力の検証用。fill と同じ規則で計算する） */
+    expectedTexts(valueOf, dropKeys) {
+      const out = [];
+      for (const { p } of this.paragraphs()) {
+        const plan = planParagraph(p, valueOf, dropKeys);
+        if (!plan.drop) out.push(plan.text);
+      }
+      return out;
     }
 
     /** 元に戻す用に、文字部品の状態を保存・復元 */
@@ -461,6 +508,10 @@
       const pageBefore = child(pPr, 'pageBreakBefore');
       const paraRPr = this._styleChain(sid, 'rPr');
 
+      if (opts.mode === 'fill' && opts.dropKeys) {
+        const plan = planParagraph(p, (k) => (opts.value(k).empty ? '\u25a0' : opts.value(k).text), opts.dropKeys);
+        if (plan.drop) return '';
+      }
       const pid = this._pmap.push(p) - 1;
       const items = paraItems(p);
       const text = items.filter((i) => i.type === 't').map((i) => i.el.textContent).join('');

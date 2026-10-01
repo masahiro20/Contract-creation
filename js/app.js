@@ -173,7 +173,7 @@
       label: f.label || key,
       type,
       group: f.group || DEFAULT_GROUP,
-      required: f.required !== undefined ? !!f.required : true,
+      required: typeof f.compute === 'function' ? false : f.required !== undefined ? !!f.required : true,
       remember: !!f.remember,
       options,
       placeholder: f.placeholder || '',
@@ -181,6 +181,8 @@
       default: f.default,
       zenkaku: !!f.zenkaku,
       blank: typeof f.blank === 'string' ? f.blank : '',
+      dropEmptyPara: !!f.dropEmptyPara,
+      compute: typeof f.compute === 'function' ? f.compute : null,
       sample: f.sample || '',
     };
   }
@@ -203,6 +205,7 @@
     if (f.default !== undefined) o.default = f.default;
     if (f.zenkaku) o.zenkaku = true;
     if (f.blank) o.blank = f.blank;
+    if (f.dropEmptyPara) o.dropEmptyPara = true;
     if (f.sample) o.sample = f.sample;
     return o;
   }
@@ -255,6 +258,18 @@
   }
 
   const isEmpty = (v) => v == null || v === '';
+
+  /** 項目の値（自動計算の項目はほかの項目から計算する） */
+  function rawValue(f, values) {
+    if (!f.compute) return values[f.key];
+    try {
+      return f.compute(values);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  const dropKeysOf = (fields) => new Set(fields.filter((f) => f.dropEmptyPara).map((f) => f.key));
 
   function formatValue(f, raw, dateStyle) {
     if (isEmpty(raw)) return f.blank || ''; // 未入力時の文字（ひな形ごとに設定）
@@ -400,6 +415,14 @@
     const ph = esc(f.placeholder);
     const val = esc(v == null ? '' : v);
     let control;
+    if (f.compute) {
+      wrap.classList.add('field-computed');
+      wrap.innerHTML =
+        `<label for="${id}" class="field-label">${esc(f.label)}<span class="badge badge-calc">自動計算</span></label>` +
+        `<input type="text" id="${id}" readonly tabindex="-1">` +
+        (f.hint ? `<div class="hint">${esc(f.hint)}</div>` : '');
+      return wrap;
+    }
     switch (f.type) {
       case 'textarea':
         control = `<textarea id="${id}" rows="3" placeholder="${ph}">${val}</textarea>`;
@@ -438,7 +461,7 @@
     const wrap = e.target.closest('.field');
     if (!wrap || !state.rec) return;
     const f = state.fieldMap.get(wrap.dataset.key);
-    if (!f) return;
+    if (!f || f.compute) return;
     setValue(f, f.type === 'money' ? digitsOnly(e.target.value) : e.target.value);
   }
 
@@ -456,8 +479,9 @@
   // ---------- プレビュー ----------
   function valueOf(key) {
     const f = state.fieldMap.get(key) || makeField(key);
-    const text = formatValue(f, state.values[key], state.dateStyle);
-    return { text, empty: isEmpty(state.values[key]) && f.required, label: f.markerLabel || f.label };
+    const raw = rawValue(f, state.values);
+    const text = formatValue(f, raw, state.dateStyle);
+    return { text, empty: isEmpty(raw) && f.required, label: f.markerLabel || f.label };
   }
 
   function scheduleUpdate() {
@@ -468,7 +492,7 @@
   function update() {
     if (!state.doc) return;
     const scroll = $('.preview-pane').scrollTop;
-    $('#paper').innerHTML = state.doc.renderHtml({ mode: 'fill', value: valueOf }).html;
+    $('#paper').innerHTML = state.doc.renderHtml({ mode: 'fill', value: valueOf, dropKeys: dropKeysOf(state.fields) }).html;
     fitPage($('#paper'));
     $('.preview-pane').scrollTop = scroll;
 
@@ -476,12 +500,17 @@
     let done = 0;
     for (const f of state.fields) {
       const wrap = $(`.field[data-key="${CSS.escape(f.key)}"]`);
-      const text = formatValue(f, state.values[f.key], state.dateStyle);
+      const raw = rawValue(f, state.values);
+      const text = formatValue(f, raw, state.dateStyle);
+      if (wrap && f.compute) {
+        const input = $('input', wrap);
+        input.value = isEmpty(raw) ? '' : text;
+      }
       if (wrap) {
         // 実際に差し込まれる文字をフォームにも表示（日付・金額など整形されるもの）
-        const out = $('.out-preview', wrap);
+        const out = $('.out-preview', wrap) || { textContent: '' };
         const shown = f.type === 'date' || f.zenkaku || f.type === 'money';
-        out.textContent = shown && !isEmpty(state.values[f.key]) ? `差し込まれる文字：${text}` : '';
+        out.textContent = shown && !f.compute && !isEmpty(raw) ? `差し込まれる文字：${text}` : '';
       }
       if (!f.required) continue;
       total++;
@@ -506,7 +535,7 @@
   }
 
   function missingLabels() {
-    return state.fields.filter((f) => f.required && isEmpty(state.values[f.key])).map((f) => f.markerLabel);
+    return state.fields.filter((f) => f.required && isEmpty(rawValue(f, state.values))).map((f) => f.markerLabel);
   }
 
   function highlightActive() {
@@ -567,16 +596,16 @@
   async function buildFilledDocx(rec, values, dateStyle) {
     const src = await DocxTemplate.load(rec.bytes);
     const fields = new Map(buildFields(src.fields(), rec.fields).map((f) => [f.key, f]));
-    const text = (key) => formatValue(fields.get(key) || makeField(key), values[key], dateStyle);
+    const text = (key) => {
+      const f = fields.get(key) || makeField(key);
+      return formatValue(f, rawValue(f, values), dateStyle);
+    };
+    const dropKeys = dropKeysOf(Array.from(fields.values()));
 
-    const expected = src.texts().map((t) => {
-      const phs = DocxTemplate.findPlaceholders(t);
-      let s = t;
-      for (const ph of phs.reverse()) s = s.slice(0, ph.start) + text(ph.key).replace(/\n/g, '') + s.slice(ph.end);
-      return s;
-    });
+    // 差し込み後に残るべき文字（差し込み箇所以外は元のまま）を先に計算しておく
+    const expected = src.expectedTexts(text, dropKeys);
 
-    src.fill(text);
+    src.fill(text, dropKeys);
     const blob = await src.toBlob();
 
     const check = await DocxTemplate.load(await blob.arrayBuffer());
@@ -672,6 +701,66 @@
   }
 
   // =====================================================================
+  // 案件データ（お客様ごとの入力内容をまとめて読み書き）
+  // =====================================================================
+  function parseCase(text) {
+    const data = JSON.parse(text);
+    const values = data && typeof data.values === 'object' ? data.values : data;
+    if (!values || typeof values !== 'object' || Array.isArray(values)) throw new Error('形式が正しくありません');
+    const clean = {};
+    for (const [k, v] of Object.entries(values)) if (v != null && typeof v !== 'object') clean[k] = String(v);
+    return { name: data.name || '', dateStyle: data.dateStyle, values: clean };
+  }
+
+  function previewCase() {
+    const box = $('#case-summary');
+    const text = $('#case-text').value.trim();
+    if (!text) return (box.innerHTML = '');
+    try {
+      const c = parseCase(text);
+      const label = (k) => (PRESET_MAP.get(k) || state.fieldMap.get(k) || {}).label || k;
+      box.innerHTML =
+        `<p><b>${esc(c.name || '案件')}</b>：${Object.keys(c.values).length} 項目</p><table>` +
+        Object.entries(c.values)
+          .map(([k, v]) => `<tr><td>${esc(label(k))}</td><td>${esc(v)}</td></tr>`)
+          .join('') +
+        '</table>';
+    } catch (e) {
+      box.innerHTML = `<p class="err">読み込めません：${esc(e.message)}</p>`;
+    }
+  }
+
+  function openCaseDialog() {
+    $('#case-text').value = '';
+    $('#case-summary').innerHTML = '';
+    $('#case-dialog').showModal();
+  }
+
+  async function loadCase() {
+    let c;
+    try {
+      c = parseCase($('#case-text').value.trim());
+    } catch (e) {
+      return toast('案件データを読み込めませんでした');
+    }
+    if (Object.keys(state.values).some((k) => !isEmpty(state.values[k])) && !confirm('今の入力内容を、読み込んだ案件データで置き換えますか？\n（今の内容は履歴に残していない場合、元に戻せません）')) return;
+    state.values = { ...c.values };
+    store.set('case', state.values);
+    if (c.dateStyle === 'wareki' || c.dateStyle === 'seireki') {
+      for (const r of allRecords()) store.set('dateStyle.' + r.id, c.dateStyle);
+    }
+    $('#case-dialog').close();
+    if (state.rec) await selectTemplate(state.rec.id);
+    toast(`${c.name || '案件データ'}を読み込みました`);
+  }
+
+  function exportCase() {
+    const name = (state.values['発注者_姓'] ? state.values['発注者_姓'] + '様' : '案件') + '_' + todayIso().replace(/-/g, '');
+    const data = { format: 'contract-maker-case', version: 1, name, dateStyle: state.dateStyle, values: state.values };
+    downloadBlob(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }), name + '.json');
+  }
+
+  // =====================================================================
   // ひな形エディタ
   // =====================================================================
   const ed = { id: null, builtinSource: false, doc: null, fields: new Map(), undo: [], sel: null };
@@ -760,6 +849,8 @@
           `<label><input type="checkbox" data-prop="remember"${f.remember ? ' checked' : ''}> 入力を記憶（自社情報など）</label>` +
           (numeric ? `<label><input type="checkbox" data-prop="zenkaku"${f.zenkaku ? ' checked' : ''}> 数字を全角にする</label>` : '') +
           (f.type === 'date' ? `<label><input type="checkbox" data-prop="today"${f.default === 'today' ? ' checked' : ''}> 初期値を今日にする</label>` : '') +
+          `<label title="例：「( ポーチ・バルコニー ○○㎡ )」の行を、面積が無いときは行ごと消す"><input type="checkbox" data-prop="dropEmptyPara"${f.dropEmptyPara ? ' checked' : ''}> 未入力のとき行ごと削除</label>` +
+          (f.compute ? '<span class="badge badge-calc">自動計算</span>' : '') +
           `</div></div>`
         );
       })
@@ -773,7 +864,7 @@
     if (!prop || !card) return;
     const f = ed.fields.get(card.dataset.key);
     if (!f) return;
-    if (prop === 'required' || prop === 'remember' || prop === 'zenkaku') f[prop] = el.checked;
+    if (prop === 'required' || prop === 'remember' || prop === 'zenkaku' || prop === 'dropEmptyPara') f[prop] = el.checked;
     else if (prop === 'today') f.default = el.checked ? 'today' : undefined;
     else if (prop === 'options') f.options = el.value.split(/[,、]/).map((s) => s.trim()).filter(Boolean);
     else f[prop] = el.value;
@@ -1029,6 +1120,18 @@
     $('#btn-docx').addEventListener('click', exportDocx);
     $('#btn-history').addEventListener('click', openHistory);
     $('#btn-new-case').addEventListener('click', newCase);
+    $('#btn-case').addEventListener('click', openCaseDialog);
+    $('#case-text').addEventListener('input', previewCase);
+    $('#case-load').addEventListener('click', loadCase);
+    $('#case-export').addEventListener('click', exportCase);
+    $('#case-file-btn').addEventListener('click', () => $('#case-file').click());
+    $('#case-file').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      $('#case-text').value = await file.text();
+      previewCase();
+    });
     $('#history-list').addEventListener('click', onHistoryClick);
     $('#btn-toggle-preview').addEventListener('click', () => document.body.classList.toggle('show-preview'));
     $('#btn-menu').addEventListener('click', () => document.body.classList.toggle('show-sidebar'));
@@ -1116,7 +1219,7 @@
 
   window.ContractApp = {
     registerBundle,
-    _internal: { formatDate, formatMoney, toZenkaku, buildFilledDocx, makeField, buildFields },
+    _internal: { formatDate, formatMoney, toZenkaku, buildFilledDocx, makeField, buildFields, rawValue, formatValue, parseCase },
   };
 
   document.addEventListener('DOMContentLoaded', init);

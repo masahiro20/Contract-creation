@@ -1,64 +1,131 @@
 /*
- * よく使う入力項目（住宅会社・施工会社 × お客様の建築工事請負向け）
+ * 入力項目の辞書（株式会社ホームランディックの契約書類に合わせたもの）
  *
  * 項目名（key）を書類間で揃えておくと、1件の案件で一度入力した内容が
- * 請負契約書・約款・合意書など、すべての書類に共通で差し込まれる。
- * remember: true の項目は自社情報として記憶され、次回以降も自動で入る。
+ * 請負契約書・重要事項説明書・合意書・変更契約書などすべてに差し込まれる。
+ *
+ * - remember: true … 自社情報など。次回以降も自動で入る
+ * - compute       … ほかの項目から自動計算する（入力欄は表示のみ）
+ * - dropEmptyPara … 空欄のとき、その行（段落）ごと削除する
+ *
+ * 氏名は「姓」「名」を別々に差し込む（ひな形の「様」「, 」やスペースは元の文字のまま残す）。
+ * 書類ごとの書式（全角数字か半角か等）は、各ひな形の項目設定「数字を全角にする」で決める。
  */
-window.FIELD_PRESETS = [
-  // 注文者（お客様）
-  { key: '注文者_氏名', label: '注文者（施主）氏名', group: '注文者（お客様）' },
-  { key: '注文者_フリガナ', label: 'フリガナ', group: '注文者（お客様）', required: false },
-  { key: '注文者_住所', label: '注文者 住所', group: '注文者（お客様）' },
-  { key: '注文者_電話', label: '注文者 電話番号', group: '注文者（お客様）', required: false },
-  { key: '注文者2_氏名', label: '連名者 氏名', group: '注文者（お客様）', required: false, hint: '共有名義の場合' },
-  { key: '注文者2_住所', label: '連名者 住所', group: '注文者（お客様）', required: false },
+(function () {
+  'use strict';
 
-  // 請負者（自社）
-  { key: '請負者_会社名', label: '請負者 会社名', group: '請負者（自社）', remember: true },
-  { key: '請負者_住所', label: '請負者 所在地', group: '請負者（自社）', remember: true },
-  { key: '請負者_代表者', label: '代表者 役職・氏名', group: '請負者（自社）', remember: true },
-  { key: '請負者_電話', label: '請負者 電話番号', group: '請負者（自社）', remember: true, required: false },
-  { key: '建設業許可番号', label: '建設業許可番号', group: '請負者（自社）', remember: true },
-  { key: '建築士事務所登録', label: '建築士事務所登録番号', group: '請負者（自社）', remember: true, required: false },
-  { key: '担当者', label: '担当者（営業・現場）', group: '請負者（自社）', required: false },
+  // ---------- 計算用の小さな関数 ----------
+  const num = (v) => {
+    const s = String(v == null ? '' : v)
+      .replace(/[０-９．]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+      .replace(/[^\d.-]/g, '');
+    return s === '' ? null : Number(s);
+  };
+  const yen = (n) => (n == null || !isFinite(n) ? '' : String(Math.round(n)));
+  const area = (n) => (n == null || !isFinite(n) ? '' : n.toFixed(2));
+  const sum = (...vals) => {
+    const ns = vals.map(num).filter((n) => n != null);
+    return ns.length ? ns.reduce((a, b) => a + b, 0) : null;
+  };
+  // 令和の年だけを返す（例：2026-09-26 → "8"）
+  const reiwaYear = (iso) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+    if (!m) return '';
+    const y = +m[1] - 2018;
+    return y >= 1 ? String(y) : '';
+  };
+  const datePart = (iso, i) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+    return m ? String(+m[i]) : '';
+  };
 
-  // 工事の概要
-  { key: '工事名称', label: '工事名称', group: '工事の概要', placeholder: '例：〇〇様邸新築工事' },
-  { key: '工事場所', label: '工事場所（地名地番）', group: '工事の概要' },
-  { key: '建物_構造', label: '構造・階数', group: '工事の概要', placeholder: '例：木造2階建て' },
-  { key: '建物_用途', label: '用途', group: '工事の概要', required: false, placeholder: '例：専用住宅' },
-  { key: '延床面積', label: '延床面積（㎡）', type: 'number', group: '工事の概要' },
-  { key: '敷地面積', label: '敷地面積（㎡）', type: 'number', group: '工事の概要', required: false },
+  window.FIELD_PRESETS = [
+    // ---------------- 発注者（お客様） ----------------
+    { key: '発注者_姓', label: '発注者 姓', group: '発注者（お客様）', placeholder: '例：山田' },
+    { key: '発注者_名', label: '発注者 名', group: '発注者（お客様）', placeholder: '例：太郎' },
+    { key: '発注者2_名', label: '連名者 名', group: '発注者（お客様）', required: false, placeholder: '例：花子', hint: '連名（ご夫婦など）の場合のみ' },
+    {
+      key: '発注者_氏名詰め',
+      label: '発注者 氏名（詰め表記）',
+      group: '発注者（お客様）',
+      hint: '合意書・変更契約書用。例：山田太郎様,花子（後ろの「様」はひな形側）',
+      compute: (v) => {
+        if (!v['発注者_姓'] && !v['発注者_名']) return '';
+        const main = `${v['発注者_姓'] || ''}${v['発注者_名'] || ''}`;
+        return v['発注者2_名'] ? `${main}様,${v['発注者2_名']}` : main;
+      },
+    },
+    { key: '発注者_住所', label: '発注者 現住所', group: '発注者（お客様）', required: false },
 
-  // 工期・日付
-  { key: '契約日', label: '契約締結日', type: 'date', group: '工期・日付', default: 'today' },
-  { key: '着工日', label: '着工日', type: 'date', group: '工期・日付' },
-  { key: '上棟日', label: '上棟予定日', type: 'date', group: '工期・日付', required: false },
-  { key: '完成日', label: '完成日（竣工）', type: 'date', group: '工期・日付' },
-  { key: '引渡日', label: '引渡日', type: 'date', group: '工期・日付' },
+    // ---------------- 工事の概要 ----------------
+    { key: '建築地', label: '工事現場住所（建築地）', group: '工事の概要', placeholder: '例：愛知県○○市○○町一丁目12番,13番', hint: '地名地番。書類によって「,」「、」の表記が異なる場合は注意' },
+    { key: '階数', label: '階数', type: 'select', options: ['２', '３', '平屋'], group: '工事の概要', hint: '「木造ガルバリウム鋼板葺２階建て」の数字部分' },
+    { key: '面積_1階', label: '1階 床面積（㎡）', type: 'number', group: '工事の概要' },
+    { key: '面積_2階', label: '2階 床面積（㎡）', type: 'number', group: '工事の概要', required: false },
+    { key: '面積_3階', label: '3階 床面積（㎡）', type: 'number', group: '工事の概要', required: false },
+    {
+      key: '延床面積',
+      label: '延べ床面積（㎡）',
+      type: 'number',
+      group: '工事の概要',
+      hint: '各階の合計を自動計算',
+      compute: (v) => area(sum(v['面積_1階'], v['面積_2階'], v['面積_3階'])),
+    },
+    { key: '面積_ポーチバルコニー', label: 'ポーチ・バルコニー面積（㎡）', type: 'number', group: '工事の概要', required: false, dropEmptyPara: true, hint: '無い場合は空欄（行ごと削除されます）' },
 
-  // 請負代金
-  { key: '請負代金', label: '請負代金額（税込）', type: 'money', group: '請負代金' },
-  { key: '工事価格', label: '工事価格（税抜）', type: 'money', group: '請負代金' },
-  { key: '消費税額', label: '取引に係る消費税額', type: 'money', group: '請負代金' },
+    // ---------------- 日付 ----------------
+    { key: '契約日', label: '請負契約日', type: 'date', group: '日付', default: 'today' },
+    { key: '契約日_年', label: '請負契約日（令和の年）', group: '日付', compute: (v) => reiwaYear(v['契約日']), hint: '「令和 ● 年」の●部分' },
+    { key: '契約日_月', label: '請負契約日（月）', group: '日付', compute: (v) => datePart(v['契約日'], 2) },
+    { key: '契約日_日', label: '請負契約日（日）', group: '日付', compute: (v) => datePart(v['契約日'], 3) },
 
-  // 支払方法
-  { key: '支払1_金額', label: '契約時 金額', type: 'money', group: '支払方法' },
-  { key: '支払1_期日', label: '契約時 支払期日', type: 'date', group: '支払方法' },
-  { key: '支払2_金額', label: '着工時 金額', type: 'money', group: '支払方法', required: false },
-  { key: '支払2_期日', label: '着工時 支払期日', type: 'date', group: '支払方法', required: false },
-  { key: '支払3_金額', label: '上棟時 金額', type: 'money', group: '支払方法', required: false },
-  { key: '支払3_期日', label: '上棟時 支払期日', type: 'date', group: '支払方法', required: false },
-  { key: '支払4_金額', label: '完成・引渡時 金額', type: 'money', group: '支払方法', required: false },
-  { key: '支払4_期日', label: '完成・引渡時 支払期日', type: 'date', group: '支払方法', required: false },
-  { key: '振込先', label: '振込先口座', type: 'textarea', group: '支払方法', remember: true, required: false },
+    // ---------------- 請負代金 ----------------
+    { key: '請負代金', label: '請負代金（税込）', type: 'money', group: '請負代金', hint: 'お見積書の「金額(税込)」' },
+    { key: '工事価格', label: '工事価格（税抜）', type: 'money', group: '請負代金', compute: (v) => (num(v['請負代金']) == null ? '' : yen(num(v['請負代金']) / 1.1)), hint: '請負代金 ÷ 1.1 で自動計算' },
+    {
+      key: '消費税',
+      label: '消費税（10%）',
+      type: 'money',
+      group: '請負代金',
+      compute: (v) => {
+        const t = num(v['請負代金']);
+        return t == null ? '' : yen(t - Math.round(t / 1.1));
+      },
+    },
 
-  // 変更・追加工事の合意書
-  { key: '原契約日', label: '原契約の締結日', type: 'date', group: '変更・追加工事' },
-  { key: '変更内容', label: '変更・追加の内容', type: 'textarea', group: '変更・追加工事' },
-  { key: '増減額', label: '増減額（税込）', type: 'money', group: '変更・追加工事' },
-  { key: '変更後_請負代金', label: '変更後の請負代金額（税込）', type: 'money', group: '変更・追加工事' },
-  { key: '変更後_完成日', label: '変更後の完成日', type: 'date', group: '変更・追加工事', required: false },
-  { key: '合意日', label: '合意日', type: 'date', group: '変更・追加工事', default: 'today' },
-];
+    // ---------------- 支払い ----------------
+    { key: '支払_契約時', label: '契約時 金額', type: 'money', group: '請負工事代金の支払い', default: '1000000' },
+    { key: '支払_配筋', label: '配筋工事完了時 金額', type: 'money', group: '請負工事代金の支払い', hint: '資金計画書の支払予定から' },
+    { key: '支払_上棟', label: '上棟時 金額', type: 'money', group: '請負工事代金の支払い' },
+    {
+      key: '支払_完成',
+      label: '完成引き渡し時 金額',
+      type: 'money',
+      group: '請負工事代金の支払い',
+      hint: '請負代金 − 契約時 − 配筋 − 上棟 で自動計算',
+      compute: (v) => {
+        const t = num(v['請負代金']);
+        if (t == null) return '';
+        return yen(t - (num(v['支払_契約時']) || 0) - (num(v['支払_配筋']) || 0) - (num(v['支払_上棟']) || 0));
+      },
+    },
+
+    // ---------------- 重要事項説明 ----------------
+    { key: '説明建築士_氏名', label: '説明をする建築士', type: 'select', options: ['伊 岐 見 恭 子', '中 谷 真 弘'], group: '重要事項説明', remember: true },
+    { key: '説明建築士_資格', label: '建築士の資格', type: 'select', options: ['一級', '二級'], group: '重要事項説明', remember: true },
+
+    // ---------------- 設計契約 ----------------
+    { key: '設計契約金', label: '設計契約金（税込）', type: 'money', group: '設計契約' },
+    { key: '設計契約金_期日', label: '設計契約金の支払期日', type: 'date', group: '設計契約' },
+    { key: '構造_設計', label: '構造（設計契約書）', group: '設計契約', placeholder: '例：２階建て 木造軸組在来工法 / 平屋建て SE構法' },
+
+    // ---------------- 変更契約・一部変更合意 ----------------
+    { key: '原契約日', label: '原契約（請負契約）の締結日', type: 'date', group: '変更契約' },
+    { key: '原請負代金', label: '原契約の請負代金（税込）', type: 'money', group: '変更契約' },
+    { key: '変更内容', label: '追加変更工事の内容', type: 'textarea', group: '変更契約' },
+    { key: '変更_差額', label: '追加変更工事 差額（税込）', type: 'money', group: '変更契約' },
+    { key: '変更後_配筋', label: '変更後 配筋工事完了時金', type: 'money', group: '変更契約', required: false },
+    { key: '変更後_上棟', label: '変更後 上棟時金', type: 'money', group: '変更契約', required: false },
+    { key: '変更後_完成', label: '変更後 完成引き渡し時金', type: 'money', group: '変更契約', required: false },
+  ];
+})();

@@ -292,3 +292,14 @@ legend { font-weight: 700; font-size: 13px; padding: 0 6px; }
 @media (max-width: 1100px) {
   .modal-full .modal-body { overflow: auto; }
 }
+
+/* 自動計算・案件データ */
+.badge-calc { background: #eef3ff; color: var(--accent); }
+.field-computed input { background: #f6f7fa !important; color: #3a4150; border-style: dashed !important; }
+#case-text { width: 100%; border: 1px solid #d6dae3; border-radius: 7px; padding: 8px 10px; font: 12px ui-monospace, Menlo, Consolas, monospace; font-weight: 400; resize: vertical; }
+.case-actions { display: flex; align-items: center; gap: 6px; margin: 8px 0; }
+.case-summary { font-size: 12px; }
+.case-summary table { border-collapse: collapse; width: 100%; }
+.case-summary td { border-bottom: 1px solid var(--line); padding: 3px 6px; vertical-align: top; }
+.case-summary td:first-child { color: var(--muted); white-space: nowrap; }
+.case-summary .err { color: var(--danger); }

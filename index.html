@@ -15,6 +15,7 @@
     </div>
     <div class="actions" id="actions" hidden>
       <button type="button" class="btn ghost" id="btn-history">履歴</button>
+      <button type="button" class="btn ghost hide-narrow" id="btn-case">案件データ</button>
       <button type="button" class="btn ghost hide-narrow" id="btn-new-case">新しい案件</button>
       <button type="button" class="btn primary" id="btn-docx">Word出力</button>
     </div>
@@ -134,6 +135,32 @@
       <span class="spacer"></span>
       <button type="button" class="btn ghost" data-close>キャンセル</button>
       <button type="button" class="btn primary" id="mark-ok">入力項目にする</button>
+    </div>
+  </dialog>
+
+  <!-- 案件データ -->
+  <dialog id="case-dialog" class="modal">
+    <div class="modal-head">
+      <h2>案件データ</h2>
+      <button type="button" class="icon-btn" data-close aria-label="閉じる">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted">お客様ごとの入力内容（氏名・建築地・面積・金額など）をまとめたデータです。読み込むと、すべての書類に同じ内容が入ります。Claude に作成を頼んだ場合も、この形式で受け取れます。</p>
+      <label class="mark-label">データを貼り付け
+        <textarea id="case-text" rows="8" spellcheck="false" placeholder='{"format":"contract-maker-case","values":{...}}'></textarea>
+      </label>
+      <div class="case-actions">
+        <button type="button" class="btn ghost small" id="case-file-btn">ファイルから読み込む</button>
+        <input type="file" id="case-file" accept=".json,application/json" hidden>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost small" id="case-export">今の入力内容を書き出す</button>
+      </div>
+      <div id="case-summary" class="case-summary"></div>
+    </div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" data-close>キャンセル</button>
+      <button type="button" class="btn primary" id="case-load">読み込む</button>
     </div>
   </dialog>
 
