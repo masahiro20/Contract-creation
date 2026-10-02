@@ -28,7 +28,7 @@
     return ns.length ? ns.reduce((a, b) => a + b, 0) : null;
   };
   // 令和の年だけを返す（例：2026-09-26 → "8"）
-  // 配筋工事完了時金・上棟時金の基本ルール：請負額 × 30% を10万円未満切り捨て
+  // 金額 × 30% を10万円未満切り捨て（請負時の配筋・上棟、変更契約の差額振り分けで使う）
   const thirtyPct = (total) => (total == null ? null : Math.floor((total * 3) / 1000000) * 100000);
   const reiwaYear = (iso) => {
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
@@ -139,27 +139,35 @@
       label: '変更後 配筋工事完了時金',
       type: 'money',
       group: '変更契約',
-      hint: '変更後の請負代金×30%（10万円未満切り捨て）',
-      compute: (v) => (num(v['原請負代金']) == null ? '' : yen(thirtyPct(num(v['原請負代金']) + (num(v['変更_差額']) || 0)))),
+      hint: '請負契約時の配筋 ＋ 差額×30%（10万円未満切り捨て）',
+      compute: (v) => {
+        const d = num(v['変更_差額']);
+        return num(v['支払_配筋']) == null || d == null ? '' : yen(num(v['支払_配筋']) + thirtyPct(d));
+      },
     },
     {
       key: '変更後_上棟',
       label: '変更後 上棟時金',
       type: 'money',
       group: '変更契約',
-      hint: '変更後の請負代金×30%（10万円未満切り捨て）',
-      compute: (v) => (num(v['原請負代金']) == null ? '' : yen(thirtyPct(num(v['原請負代金']) + (num(v['変更_差額']) || 0)))),
+      hint: '請負契約時の上棟 ＋ 差額×30%（10万円未満切り捨て）',
+      compute: (v) => {
+        const d = num(v['変更_差額']);
+        return num(v['支払_上棟']) == null || d == null ? '' : yen(num(v['支払_上棟']) + thirtyPct(d));
+      },
     },
     {
       key: '変更後_完成',
       label: '変更後 完成引き渡し時金',
       type: 'money',
       group: '変更契約',
-      hint: '変更後の請負代金 − 契約時 − 配筋 − 上棟（残額を1円単位で）',
+      hint: '請負契約時の完成 ＋ 差額の残り（差額 − 配筋・上棟への加算分）',
       compute: (v) => {
-        if (num(v['原請負代金']) == null) return '';
-        const total = num(v['原請負代金']) + (num(v['変更_差額']) || 0);
-        return yen(total - (num(v['支払_契約時']) || 0) - 2 * thirtyPct(total));
+        const d = num(v['変更_差額']);
+        const t = num(v['原請負代金']);
+        if (d == null || t == null) return '';
+        const kansei = t - (num(v['支払_契約時']) || 0) - (num(v['支払_配筋']) || 0) - (num(v['支払_上棟']) || 0);
+        return yen(kansei + d - 2 * thirtyPct(d));
       },
     },
   ];
