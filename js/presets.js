@@ -28,6 +28,8 @@
     return ns.length ? ns.reduce((a, b) => a + b, 0) : null;
   };
   // 令和の年だけを返す（例：2026-09-26 → "8"）
+  // 配筋工事完了時金・上棟時金の基本ルール：請負額 × 30% を10万円未満切り捨て
+  const thirtyPct = (total) => (total == null ? null : Math.floor((total * 3) / 1000000) * 100000);
   const reiwaYear = (iso) => {
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
     if (!m) return '';
@@ -95,8 +97,8 @@
 
     // ---------------- 支払い ----------------
     { key: '支払_契約時', label: '契約時 金額', type: 'money', group: '請負工事代金の支払い', default: '1000000' },
-    { key: '支払_配筋', label: '配筋工事完了時 金額', type: 'money', group: '請負工事代金の支払い', hint: '資金計画書の支払予定から' },
-    { key: '支払_上棟', label: '上棟時 金額', type: 'money', group: '請負工事代金の支払い' },
+    { key: '支払_配筋', label: '配筋工事完了時 金額', type: 'money', group: '請負工事代金の支払い', hint: '基本は請負代金×30%（10万円未満切り捨て）' },
+    { key: '支払_上棟', label: '上棟時 金額', type: 'money', group: '請負工事代金の支払い', hint: '基本は請負代金×30%（10万円未満切り捨て）' },
     {
       key: '支払_完成',
       label: '完成引き渡し時 金額',
@@ -124,8 +126,41 @@
     { key: '原請負代金', label: '原契約の請負代金（税込）', type: 'money', group: '変更契約' },
     { key: '変更内容', label: '追加変更工事の内容', type: 'textarea', group: '変更契約' },
     { key: '変更_差額', label: '追加変更工事 差額（税込）', type: 'money', group: '変更契約' },
-    { key: '変更後_配筋', label: '変更後 配筋工事完了時金', type: 'money', group: '変更契約', required: false },
-    { key: '変更後_上棟', label: '変更後 上棟時金', type: 'money', group: '変更契約', required: false },
-    { key: '変更後_完成', label: '変更後 完成引き渡し時金', type: 'money', group: '変更契約', required: false },
+    {
+      key: '変更後_請負代金',
+      label: '変更後の請負代金（税込）',
+      type: 'money',
+      group: '変更契約',
+      hint: '原契約の請負代金 ＋ 差額',
+      compute: (v) => (num(v['原請負代金']) == null ? '' : yen(num(v['原請負代金']) + (num(v['変更_差額']) || 0))),
+    },
+    {
+      key: '変更後_配筋',
+      label: '変更後 配筋工事完了時金',
+      type: 'money',
+      group: '変更契約',
+      hint: '変更後の請負代金×30%（10万円未満切り捨て）',
+      compute: (v) => (num(v['原請負代金']) == null ? '' : yen(thirtyPct(num(v['原請負代金']) + (num(v['変更_差額']) || 0)))),
+    },
+    {
+      key: '変更後_上棟',
+      label: '変更後 上棟時金',
+      type: 'money',
+      group: '変更契約',
+      hint: '変更後の請負代金×30%（10万円未満切り捨て）',
+      compute: (v) => (num(v['原請負代金']) == null ? '' : yen(thirtyPct(num(v['原請負代金']) + (num(v['変更_差額']) || 0)))),
+    },
+    {
+      key: '変更後_完成',
+      label: '変更後 完成引き渡し時金',
+      type: 'money',
+      group: '変更契約',
+      hint: '変更後の請負代金 − 契約時 − 配筋 − 上棟（残額を1円単位で）',
+      compute: (v) => {
+        if (num(v['原請負代金']) == null) return '';
+        const total = num(v['原請負代金']) + (num(v['変更_差額']) || 0);
+        return yen(total - (num(v['支払_契約時']) || 0) - 2 * thirtyPct(total));
+      },
+    },
   ];
 })();
